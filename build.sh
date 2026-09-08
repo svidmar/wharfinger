@@ -1,19 +1,21 @@
 #!/bin/sh
-# Builds Ports.app. With --install, copies it to ~/Applications and launches it.
+# Builds Portkeeper.app. With --install, copies it to ~/Applications and launches it.
 set -e
 cd "$(dirname "$0")"
-app="build/Ports.app"
+app="build/Portkeeper.app"
 rm -rf build
 mkdir -p "$app/Contents/MacOS"
-swiftc -O -o "$app/Contents/MacOS/Ports" Ports/main.swift
-cp Ports/Info.plist "$app/Contents/"
+swiftc -O -o "$app/Contents/MacOS/Portkeeper" Portkeeper/main.swift
+cp Portkeeper/Info.plist "$app/Contents/"
 codesign --force --sign - "$app"
 echo "built $app"
 if [ "$1" = "--install" ]; then
-    pkill -x Ports 2>/dev/null || true
-    mkdir -p ~/Applications
+    pkill -x Portkeeper 2>/dev/null || true
+    pkill -x Ports 2>/dev/null || true          # the app's old name
     rm -rf ~/Applications/Ports.app
+    mkdir -p ~/Applications
+    rm -rf ~/Applications/Portkeeper.app
     cp -R "$app" ~/Applications/
-    open ~/Applications/Ports.app
-    echo "installed and launched ~/Applications/Ports.app"
+    open ~/Applications/Portkeeper.app
+    echo "installed and launched ~/Applications/Portkeeper.app"
 fi

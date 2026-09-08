@@ -7,12 +7,15 @@ Usage:
   ports who PORT        who is using PORT? (exit 1 if free)
   ports open PORT       open http://localhost:PORT in the browser
   ports kill PORT [-9]  kill the process (or stop the container) listening on PORT
+  ports restart PORT    stop it and start the same command again (same cwd and env)
+                        in a new Terminal window; --here runs it in this terminal instead
 
 Docker containers with published ports are listed too, when the daemon runs.
 Each dev server is probed with one HTTP GET to show the framework / page title.
 No dependencies beyond macOS's lsof/ps and Python 3.
 """
 
+import ctypes
 import curses
 import html
 import json
@@ -272,6 +275,72 @@ def kill(entry: Entry, force: bool = False) -> str:
     return f"sent {'SIGKILL' if force else 'SIGTERM'} to pid {entry.pid}, still running (try K)"
 
 
+def proc_args_env(pid: int):
+    """Exact argv and environment of one of our own processes (sysctl KERN_PROCARGS2)."""
+    libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+    mib = (ctypes.c_int * 3)(1, 49, pid)  # CTL_KERN, KERN_PROCARGS2
+    size = ctypes.c_size_t(0)
+    if libc.sysctl(mib, 3, None, ctypes.byref(size), None, 0) != 0 or size.value <= 4:
+        return None
+    buf = ctypes.create_string_buffer(size.value)
+    if libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0) != 0:
+        return None
+    raw = buf.raw[: size.value]
+    argc = int.from_bytes(raw[:4], sys.byteorder)
+    i = raw.index(b"\0", 4)          # end of exec path
+    while i < len(raw) and raw[i:i + 1] == b"\0":
+        i += 1
+    strings = [x.decode("utf-8", "replace") for x in raw[i:].split(b"\0") if x]
+    if argc <= 0 or len(strings) < argc:
+        return None
+    env = dict(x.split("=", 1) for x in strings[argc:] if "=" in x)
+    return strings[:argc], env
+
+
+SKIP_ENV_PREFIXES = ("TERM", "SHLVL", "PWD", "OLDPWD", "_", "__CF", "XPC_", "TMPDIR", "SECURITYSESSIONID", "COMMAND_MODE", "LaunchInstanceID", "SSH_")
+
+
+def sh_quote(s: str) -> str:
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+def write_restart_script(argv, env, cwd: str, port: int) -> str:
+    d = os.path.join(HOME, "Library", "Application Support", "Portkeeper")
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, f"restart-{port}.command")
+    lines = ["#!/bin/sh", f"# Portkeeper restart of :{port}", f"cd {sh_quote(cwd)} || exit 1"]
+    for k in sorted(env):
+        if not k.startswith(SKIP_ENV_PREFIXES):
+            lines.append(f"export {k}={sh_quote(env[k])}")
+    lines.append("echo " + sh_quote(f"Portkeeper: restarting {' '.join(argv)} in {cwd}"))
+    lines.append("exec " + " ".join(sh_quote(a) for a in argv))
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    os.chmod(path, 0o755)
+    return path
+
+
+def restart(entry: Entry, here: bool = False) -> str:
+    """Kill the process and re-run its exact command in its cwd with its env."""
+    if entry.container:
+        _run([DOCKER, "restart", entry.container])
+        return f"docker restart {entry.name[7:]} (:{entry.port})"
+    got = proc_args_env(entry.pid)
+    if not got:
+        return f"cannot read the command line of pid {entry.pid} (only your own processes can be restarted)"
+    argv, env = got
+    cwd = os.path.expanduser(entry.cwd) if entry.cwd else HOME
+    script = write_restart_script(argv, env, cwd, entry.port)
+    msg = kill(entry, False)
+    if "still running" in msg:
+        kill(entry, True)
+        time.sleep(0.3)
+    if here:
+        os.execv("/bin/sh", ["/bin/sh", script])
+    subprocess.run(["open", "-b", "com.apple.terminal", script], check=False)
+    return f"restarting {entry.name} on :{entry.port} in a new Terminal window"
+
+
 def short_cmd(cmd: str, width: int) -> str:
     parts = cmd.split(" ")
     parts[0] = os.path.basename(parts[0]) or parts[0]
@@ -341,10 +410,18 @@ def cmd_kill(port: int, force: bool):
     print(kill(e, force))
 
 
+def cmd_restart(port: int, here: bool):
+    e = find_port(port)
+    if e is None:
+        print(f"nothing listening on :{port}", file=sys.stderr)
+        sys.exit(1)
+    print(restart(e, here))
+
+
 # ----------------------------------------------------------------- TUI
 
 
-HELP = "↑↓ move  ⏎/o open  c copy url  k kill  K kill -9  a all/dev-only  / filter  r refresh  q quit"
+HELP = "↑↓ move  ⏎/o open  c copy url  k kill  K kill -9  R restart  a all/dev-only  / filter  r refresh  q quit"
 
 
 def tui(stdscr):
@@ -520,6 +597,12 @@ def tui(stdscr):
             if ask(f"Force {'stop' if e.container else 'kill (-9)'} {e.name} on :{e.port}?"):
                 set_status(kill(e, True))
                 refresh_data()
+        elif ch == ord("R") and rows:
+            e = rows[sel]
+            if ask(f"Restart {e.name} on :{e.port} in a new Terminal window?"):
+                set_status(restart(e))
+                time.sleep(1.0)
+                refresh_data()
         elif ch == ord("a"):
             include_system = not include_system
             refresh_data()
@@ -549,6 +632,8 @@ def main(argv):
         cmd_open(int(args[1]))
     elif sub in ("kill", "k") and len(args) >= 2 and args[1].isdigit():
         cmd_kill(int(args[1]), "-9" in args or "--force" in args)
+    elif sub in ("restart", "rs") and len(args) >= 2 and args[1].isdigit():
+        cmd_restart(int(args[1]), "--here" in args)
     elif sub in ("-h", "--help", "help"):
         print(__doc__.strip())
     else:

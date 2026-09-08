@@ -1,4 +1,4 @@
-// Ports – menu bar app: see, open and kill local listening servers.
+// Portkeeper – menu bar app: see, open, kill and restart local listening servers.
 // Build with ./build.sh (plain swiftc, no Xcode project needed).
 
 import AppKit
@@ -126,6 +126,56 @@ func collect() -> [Entry] {
         return Entry(port: s.port, addr: s.addr, pid: s.pid, name: s.name, cmd: cmd,
                      cwd: tilde(cwds[s.pid] ?? ""), system: isSystem(cmd: cmd, name: s.name))
     }.sorted { $0.port == $1.port ? $0.pid < $1.pid : $0.port < $1.port }
+}
+
+// MARK: - Restart
+
+/// Exact argv and environment of one of our own processes (KERN_PROCARGS2).
+func procArgsEnv(_ pid: Int32) -> (argv: [String], env: [String: String])? {
+    var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
+    var size = 0
+    guard sysctl(&mib, 3, nil, &size, nil, 0) == 0, size > 4 else { return nil }
+    var buf = [UInt8](repeating: 0, count: size)
+    guard sysctl(&mib, 3, &buf, &size, nil, 0) == 0 else { return nil }
+    let argc = Int(buf.withUnsafeBytes { $0.load(as: Int32.self) })
+    var i = 4
+    while i < size, buf[i] != 0 { i += 1 }        // exec path
+    while i < size, buf[i] == 0 { i += 1 }        // padding
+    var strings: [String] = []
+    var start = i
+    while i < size {
+        if buf[i] == 0 {
+            if i > start { strings.append(String(decoding: buf[start..<i], as: UTF8.self)) }
+            start = i + 1
+        }
+        i += 1
+    }
+    guard strings.count >= argc, argc > 0 else { return nil }
+    var env: [String: String] = [:]
+    for s in strings[argc...] {
+        if let eq = s.firstIndex(of: "=") { env[String(s[..<eq])] = String(s[s.index(after: eq)...]) }
+    }
+    return (Array(strings[..<argc]), env)
+}
+
+func shQuote(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
+
+let skipEnvPrefixes = ["TERM", "SHLVL", "PWD", "OLDPWD", "_", "__CF", "XPC_", "TMPDIR", "SECURITYSESSIONID", "COMMAND_MODE", "LaunchInstanceID", "SSH_"]
+
+/// Writes a .command script that re-runs the process in its cwd with its environment, for Terminal.app.
+func writeRestartScript(argv: [String], env: [String: String], cwd: String, port: Int) -> URL? {
+    let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Portkeeper")
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    let file = dir.appendingPathComponent("restart-\(port).command")
+    var lines = ["#!/bin/sh", "# Portkeeper restart of :\(port)", "cd \(shQuote(cwd)) || exit 1"]
+    for (k, v) in env.sorted(by: { $0.key < $1.key }) where !skipEnvPrefixes.contains(where: { k.hasPrefix($0) }) {
+        lines.append("export \(k)=\(shQuote(v))")
+    }
+    lines.append("echo \(shQuote("Portkeeper: restarting " + argv.joined(separator: " ") + " in " + cwd))")
+    lines.append("exec " + argv.map(shQuote).joined(separator: " "))
+    guard (try? (lines.joined(separator: "\n") + "\n").write(to: file, atomically: true, encoding: .utf8)) != nil else { return nil }
+    chmod(file.path, 0o755)
+    return file
 }
 
 // MARK: - Docker
@@ -256,6 +306,17 @@ final class Prober {
 
 // MARK: - App
 
+let iconChoices: [(name: String, symbol: String)] = [
+    ("Server rack", "server.rack"),
+    ("Nodes", "point.3.connected.trianglepath.dotted"),
+    ("Antenna", "antenna.radiowaves.left.and.right"),
+    ("Terminal", "terminal"),
+    ("Bolt", "bolt.horizontal"),
+    ("Plug", "powerplug"),
+    ("Chip", "cpu"),
+    ("Globe", "network"),
+]
+
 final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotificationCenterDelegate {
     var item: NSStatusItem!
     let menu = NSMenu()
@@ -270,10 +331,21 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
         set { UserDefaults.standard.set(newValue, forKey: "notify") }
     }
     var refreshing = false
+    var iconSymbol: String {
+        get { UserDefaults.standard.string(forKey: "icon") ?? iconChoices[0].symbol }
+        set { UserDefaults.standard.set(newValue, forKey: "icon"); applyIcon() }
+    }
+
+    func applyIcon() {
+        let img = NSImage(systemSymbolName: iconSymbol, accessibilityDescription: "Portkeeper")
+            ?? NSImage(systemSymbolName: "network", accessibilityDescription: "Portkeeper")
+        img?.isTemplate = true
+        item.button?.image = img
+    }
 
     func applicationDidFinishLaunching(_ note: Notification) {
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        item.button?.image = NSImage(systemSymbolName: "network", accessibilityDescription: "Ports")
+        applyIcon()
         item.button?.imagePosition = .imageLeading
         item.button?.font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
         menu.delegate = self
@@ -425,8 +497,20 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
         login.target = self
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
         menu.addItem(login)
+        let icons = NSMenu()
+        for c in iconChoices {
+            let m = NSMenuItem(title: c.name, action: #selector(chooseIcon(_:)), keyEquivalent: "")
+            m.target = self
+            m.representedObject = c.symbol
+            m.image = NSImage(systemSymbolName: c.symbol, accessibilityDescription: nil)
+            m.state = c.symbol == iconSymbol ? .on : .off
+            icons.addItem(m)
+        }
+        let iconItem = NSMenuItem(title: "Icon", action: nil, keyEquivalent: "")
+        iconItem.submenu = icons
+        menu.addItem(iconItem)
         menu.addItem(header("⌃⌥P opens this menu anywhere"))
-        menu.addItem(withTitle: "Quit Ports", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        menu.addItem(withTitle: "Quit Portkeeper", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
     }
 
     func header(_ title: String) -> NSMenuItem {
@@ -472,6 +556,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
         sub.addItem(action("Open \(e.url)", #selector(openURL(_:)), box))
         sub.addItem(action("Copy URL", #selector(copyURL(_:)), box))
         sub.addItem(.separator())
+        sub.addItem(action("Restart (in a new Terminal window)", #selector(restart(_:)), box))
         sub.addItem(action("Kill (SIGTERM)", #selector(killTerm(_:)), box))
         sub.addItem(action("Force Kill (SIGKILL)", #selector(killForce(_:)), box))
         sub.addItem(.separator())
@@ -553,6 +638,38 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
             err.runModal()
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { self.refreshAsync() }
+    }
+
+    @objc func chooseIcon(_ sender: Any?) {
+        if let s = (sender as? NSMenuItem)?.representedObject as? String { iconSymbol = s }
+    }
+
+    @objc func restart(_ sender: Any?) {
+        guard let e = box(sender)?.entry else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        guard let (argv, env) = procArgsEnv(e.pid) else {
+            let a = NSAlert()
+            a.messageText = "Cannot read the command line of pid \(e.pid)"
+            a.informativeText = "Only your own processes can be restarted."
+            a.runModal()
+            return
+        }
+        let cwd = e.cwd.hasPrefix("~") ? home + e.cwd.dropFirst() : e.cwd
+        let a = NSAlert()
+        a.messageText = "Restart \(e.name) on :\(e.port)?"
+        a.informativeText = "It will be stopped and started again in a new Terminal window, with the same command, directory and environment.\n\n\(argv.joined(separator: " ").prefix(200))\nin \(e.cwd)"
+        a.addButton(withTitle: "Restart")
+        a.addButton(withTitle: "Cancel")
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+        guard let script = writeRestartScript(argv: argv, env: env, cwd: cwd, port: e.port) else { return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            kill(e.pid, SIGTERM)
+            var gone = false
+            for _ in 0..<50 { usleep(100_000); if kill(e.pid, 0) != 0 { gone = true; break } }
+            if !gone { kill(e.pid, SIGKILL); usleep(300_000) }
+            _ = run("/usr/bin/open", ["-b", "com.apple.terminal", script.path])
+            DispatchQueue.main.async { DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { self.refreshAsync() } }
+        }
     }
 
     @objc func dockerStop(_ sender: Any?) { if let c = box(sender)?.container { dockerCmd("stop", c) } }
