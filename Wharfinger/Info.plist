@@ -2,10 +2,10 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>CFBundleName</key><string>Portkeeper</string>
-    <key>CFBundleDisplayName</key><string>Portkeeper</string>
-    <key>CFBundleIdentifier</key><string>dk.sv.portkeeper</string>
-    <key>CFBundleExecutable</key><string>Portkeeper</string>
+    <key>CFBundleName</key><string>Wharfinger</string>
+    <key>CFBundleDisplayName</key><string>Wharfinger</string>
+    <key>CFBundleIdentifier</key><string>dk.sv.wharfinger</string>
+    <key>CFBundleExecutable</key><string>Wharfinger</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleVersion</key><string>1</string>
     <key>CFBundleShortVersionString</key><string>1.0</string>

@@ -1,4 +1,4 @@
-# Portkeeper
+# Wharfinger
 
 See what is listening on localhost, what answers there, and open, kill or restart it.
 For macOS. A menu bar app plus a terminal command, no dependencies beyond what ships with macOS.
@@ -12,7 +12,7 @@ For macOS. A menu bar app plus a terminal command, no dependencies beyond what s
 ## Menu bar app
 
 ```
-./build.sh --install   # builds Portkeeper.app with swiftc, copies it to ~/Applications and launches it
+./build.sh --install   # builds Wharfinger.app with swiftc, copies it to ~/Applications and launches it
 ```
 
 - The icon shows how many dev servers and containers are listening. Click it for the list.
@@ -31,8 +31,8 @@ Apps and system processes (Spotify, Dropbox, Control Center …) are folded into
 so the list stays about your servers. A process counts as an app when its executable lives in
 /Applications, /System, /Library or ~/Library.
 
-Requires macOS 13 or newer and the Xcode Command Line Tools (for `swiftc`). Source: `Portkeeper/main.swift`.
-`PORTS_DEBUG=1 build/Portkeeper.app/Contents/MacOS/Portkeeper` runs it in the terminal and logs
+Requires macOS 13 or newer and the Xcode Command Line Tools (for `swiftc`). Source: `Wharfinger/main.swift`.
+`PORTS_DEBUG=1 build/Wharfinger.app/Contents/MacOS/Wharfinger` runs it in the terminal and logs
 refreshes, probes and notifications.
 
 ## Terminal command
@@ -71,7 +71,7 @@ Green process names are dev servers, yellow are apps/system, cyan are Docker con
   (Vite, Next.js, Nuxt, SvelteKit, Django, FastAPI, Uvicorn, Flask, Express, Jupyter, Ollama …) and the `<title>` is read.
 - Docker rows come from `docker ps`, when the daemon is running.
 - Restart reads the exact argv and environment of the process via `sysctl KERN_PROCARGS2`,
-  writes them to a `.command` script under `~/Library/Application Support/Portkeeper/` and opens it in Terminal.
+  writes them to a `.command` script under `~/Library/Application Support/Wharfinger/` and opens it in Terminal.
 - Only your own processes can be inspected or killed without sudo.
 
 ## License

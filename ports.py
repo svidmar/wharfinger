@@ -305,14 +305,14 @@ def sh_quote(s: str) -> str:
 
 
 def write_restart_script(argv, env, cwd: str, port: int) -> str:
-    d = os.path.join(HOME, "Library", "Application Support", "Portkeeper")
+    d = os.path.join(HOME, "Library", "Application Support", "Wharfinger")
     os.makedirs(d, exist_ok=True)
     path = os.path.join(d, f"restart-{port}.command")
-    lines = ["#!/bin/sh", f"# Portkeeper restart of :{port}", f"cd {sh_quote(cwd)} || exit 1"]
+    lines = ["#!/bin/sh", f"# Wharfinger restart of :{port}", f"cd {sh_quote(cwd)} || exit 1"]
     for k in sorted(env):
         if not k.startswith(SKIP_ENV_PREFIXES):
             lines.append(f"export {k}={sh_quote(env[k])}")
-    lines.append("echo " + sh_quote(f"Portkeeper: restarting {' '.join(argv)} in {cwd}"))
+    lines.append("echo " + sh_quote(f"Wharfinger: restarting {' '.join(argv)} in {cwd}"))
     lines.append("exec " + " ".join(sh_quote(a) for a in argv))
     with open(path, "w") as f:
         f.write("\n".join(lines) + "\n")

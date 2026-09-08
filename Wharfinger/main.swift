@@ -1,4 +1,4 @@
-// Portkeeper – menu bar app: see, open, kill and restart local listening servers.
+// Wharfinger – menu bar app: see, open, kill and restart local listening servers.
 // Build with ./build.sh (plain swiftc, no Xcode project needed).
 
 import AppKit
@@ -164,14 +164,14 @@ let skipEnvPrefixes = ["TERM", "SHLVL", "PWD", "OLDPWD", "_", "__CF", "XPC_", "T
 
 /// Writes a .command script that re-runs the process in its cwd with its environment, for Terminal.app.
 func writeRestartScript(argv: [String], env: [String: String], cwd: String, port: Int) -> URL? {
-    let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Portkeeper")
+    let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Wharfinger")
     try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     let file = dir.appendingPathComponent("restart-\(port).command")
-    var lines = ["#!/bin/sh", "# Portkeeper restart of :\(port)", "cd \(shQuote(cwd)) || exit 1"]
+    var lines = ["#!/bin/sh", "# Wharfinger restart of :\(port)", "cd \(shQuote(cwd)) || exit 1"]
     for (k, v) in env.sorted(by: { $0.key < $1.key }) where !skipEnvPrefixes.contains(where: { k.hasPrefix($0) }) {
         lines.append("export \(k)=\(shQuote(v))")
     }
-    lines.append("echo \(shQuote("Portkeeper: restarting " + argv.joined(separator: " ") + " in " + cwd))")
+    lines.append("echo \(shQuote("Wharfinger: restarting " + argv.joined(separator: " ") + " in " + cwd))")
     lines.append("exec " + argv.map(shQuote).joined(separator: " "))
     guard (try? (lines.joined(separator: "\n") + "\n").write(to: file, atomically: true, encoding: .utf8)) != nil else { return nil }
     chmod(file.path, 0o755)
@@ -337,8 +337,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
     }
 
     func applyIcon() {
-        let img = NSImage(systemSymbolName: iconSymbol, accessibilityDescription: "Portkeeper")
-            ?? NSImage(systemSymbolName: "network", accessibilityDescription: "Portkeeper")
+        let img = NSImage(systemSymbolName: iconSymbol, accessibilityDescription: "Wharfinger")
+            ?? NSImage(systemSymbolName: "network", accessibilityDescription: "Wharfinger")
         img?.isTemplate = true
         item.button?.image = img
     }
@@ -510,7 +510,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
         iconItem.submenu = icons
         menu.addItem(iconItem)
         menu.addItem(header("⌃⌥P opens this menu anywhere"))
-        menu.addItem(withTitle: "Quit Portkeeper", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        menu.addItem(withTitle: "Quit Wharfinger", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
     }
 
     func header(_ title: String) -> NSMenuItem {
