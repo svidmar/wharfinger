@@ -9,6 +9,9 @@ Usage:
   ports kill PORT [-9]  kill the process (or stop the container) listening on PORT
   ports restart PORT    stop it and start the same command again (same cwd and env)
                         in a new Terminal window; --here runs it in this terminal instead
+  ports edit PORT       open the project directory in your editor ($PORTS_EDITOR app name,
+                        else VS Code / Cursor / Zed …, else $VISUAL / $EDITOR)
+  ports dir PORT        print the project directory, for: cd "$(ports dir 3000)"
 
 Docker containers with published ports are listed too, when the daemon runs.
 Each dev server is probed with one HTTP GET to show the framework / page title.
@@ -57,6 +60,13 @@ class Entry:
     system: bool
     container: str = ""   # docker container id, when this row is a container
     label: str = ""       # what answered the HTTP probe
+    app: str = ""         # recognised program (uvicorn, Vite, Jupyter kernel …)
+    env_tag: str = ""     # "python 3.12.3 · venv .venv"
+    env_details: list = field(default_factory=list)
+
+    @property
+    def display(self) -> str:
+        return self.app or self.name
 
     @property
     def key(self) -> str:
@@ -85,6 +95,8 @@ def _tilde(path: str) -> str:
 
 def _is_system(cmd: str, name: str) -> bool:
     exe = cmd.split(" ", 1)[0] if cmd else name
+    if "/Frameworks/" in exe and ".framework/" in exe:
+        return False  # python.org's Python.framework and friends are runtimes, not apps
     if ".app/Contents/" in exe:
         return True
     return exe.startswith(SYSTEM_PREFIXES)
@@ -109,8 +121,8 @@ def collect(include_system: bool = True):
             port = int(port)
             key = (pid, port)
             # IPv4 + IPv6 on the same port collapse to one row; prefer the wildcard.
-            if key in seen and seen[key].addr in ("*", "0.0.0.0", "::"):
-                continue
+            if key in seen and addr not in ("*", "0.0.0.0", "::"):
+                continue  # keep the first (IPv4) row
             seen[key] = Entry(port, addr, pid, name, "", "", False)
 
     if not seen:
@@ -139,6 +151,8 @@ def collect(include_system: bool = True):
         e.cwd = _tilde(cwds.get(e.pid, ""))
         e.system = _is_system(e.cmd, e.name)
         if include_system or not e.system:
+            if not e.system:
+                describe_env(e)
             entries.append(e)
 
     entries.sort(key=lambda e: (e.port, e.pid))
@@ -185,7 +199,7 @@ FRAMEWORK_HINTS = [
     ("Storybook", lambda b, sv, pw: "storybook" in b),
     ("Streamlit", lambda b, sv, pw: "streamlit" in b),
     ("Gradio", lambda b, sv, pw: "gradio" in b),
-    ("Jupyter", lambda b, sv, pw: "jupyter" in b),
+    ("Jupyter", lambda b, sv, pw: "jupyter-config-data" in b or "jupyterlab" in b or "/static/notebook/" in b),
     ("Ollama", lambda b, sv, pw: "ollama is running" in b),
     ("Grafana", lambda b, sv, pw: "grafana" in b),
     ("Swagger UI", lambda b, sv, pw: "swagger-ui" in b),
@@ -288,13 +302,127 @@ def proc_args_env(pid: int):
     raw = buf.raw[: size.value]
     argc = int.from_bytes(raw[:4], sys.byteorder)
     i = raw.index(b"\0", 4)          # end of exec path
+    exec_path = raw[4:i].decode("utf-8", "replace")
     while i < len(raw) and raw[i:i + 1] == b"\0":
         i += 1
     strings = [x.decode("utf-8", "replace") for x in raw[i:].split(b"\0") if x]
     if argc <= 0 or len(strings) < argc:
         return None
     env = dict(x.split("=", 1) for x in strings[argc:] if "=" in x)
-    return strings[:argc], env
+    return exec_path, strings[:argc], env
+
+
+APP_HINTS = [
+    ("ipykernel_launcher", "Jupyter kernel"), ("jupyter-lab", "JupyterLab"), ("jupyter lab", "JupyterLab"), ("jupyterlab", "JupyterLab"),
+    ("jupyter-notebook", "Jupyter Notebook"), ("jupyter notebook", "Jupyter Notebook"), ("jupyter", "Jupyter"),
+    ("uvicorn", "uvicorn"), ("gunicorn", "gunicorn"), ("hypercorn", "hypercorn"), ("manage.py runserver", "Django runserver"),
+    ("flask", "Flask"), ("streamlit", "Streamlit"), ("gradio", "Gradio"), ("mkdocs", "MkDocs"), ("http.server", "http.server"),
+    ("vite", "Vite"), ("next", "Next.js"), ("nuxt", "Nuxt"), ("astro", "Astro"), ("remix", "Remix"), ("webpack", "webpack"),
+    ("storybook", "Storybook"), ("nodemon", "nodemon"), ("ts-node", "ts-node"), ("tsx", "tsx"), ("rails", "Rails"), ("puma", "Puma"),
+    ("php artisan serve", "Laravel"), ("mix phx.server", "Phoenix"), ("hugo", "Hugo"), ("jekyll", "Jekyll"), ("ollama", "Ollama"),
+]
+KNOWN_RUNTIMES = {"python", "node", "bun", "deno", "ruby", "php", "java", "perl", "elixir", "julia"}
+INTERESTING_ENV = ["NODE_ENV", "PORT", "HOST", "DJANGO_SETTINGS_MODULE", "FLASK_APP", "FLASK_ENV", "FLASK_DEBUG", "RAILS_ENV", "RACK_ENV",
+                   "MIX_ENV", "APP_ENV", "ENV", "ENVIRONMENT", "DEBUG", "PYTHONPATH", "CONDA_DEFAULT_ENV", "JUPYTER_CONFIG_DIR"]
+_env_cache = {}
+_version_cache = {}
+
+
+def _version_of(exe: str, runtime: str) -> str:
+    if exe not in _version_cache:
+        out = _run_both([exe, "-version" if runtime == "java" else "--version"])
+        m = re.search(r"(\d+\.\d+(?:\.\d+)?)", out)
+        _version_cache[exe] = m.group(1) if m else ""
+    return _version_cache[exe]
+
+
+def _run_both(args):
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, check=False, timeout=5)
+        return r.stdout + r.stderr
+    except Exception:
+        return ""
+
+
+def _runtime_name(base: str) -> str:
+    b = base.lower()
+    for name in ("python", "ruby", "php"):
+        if re.match(rf"^{name}\d*(\.\d+)?$", b):
+            return name
+    return "node" if b in ("node", "nodejs") else b
+
+
+def describe_env(entry: Entry):
+    """Fill entry.app / env_tag / env_details from the process' exec path, argv and environment."""
+    if entry.pid in _env_cache:
+        entry.app, entry.env_tag, entry.env_details = _env_cache[entry.pid]
+        return
+    got = proc_args_env(entry.pid)
+    if not got:
+        return
+    exec_path, argv, env = got
+    cwd = os.path.realpath(os.path.expanduser(entry.cwd)) if entry.cwd else HOME
+    exe = os.path.normpath(exec_path if exec_path.startswith("/") else os.path.join(cwd, exec_path))  # keep symlinks
+    base = os.path.basename(exe)
+    runtime = _runtime_name(base)
+    version, manager, details, app = "", "", [], ""
+    joined = " ".join(argv).lower()
+    for needle, name in APP_HINTS:
+        if re.search(r"(^|[/ ])" + re.escape(needle) + r"($|[ /.])", joined):
+            app = name
+            break
+
+    bin_dir = os.path.dirname(exe)
+    venv = env.get("VIRTUAL_ENV") or (os.path.dirname(bin_dir) if os.path.basename(bin_dir) == "bin" else "")
+    cfg = ""
+    if runtime == "python" and venv and os.path.isfile(os.path.join(venv, "pyvenv.cfg")):
+        cfg = open(os.path.join(venv, "pyvenv.cfg")).read()
+    if cfg:
+        venv = os.path.realpath(venv)
+        m = re.search(r"^version(?:_info)?\s*=\s*(\d+\.\d+(?:\.\d+)?)", cfg, re.M)
+        version = m.group(1) if m else ""
+        name = venv[len(cwd) + 1:] if venv.startswith(cwd + "/") else _tilde(venv)
+        kind = "uv venv" if re.search(r"^uv = ", cfg, re.M) else "poetry venv" if "pypoetry/virtualenvs" in venv else "venv"
+        manager = f"{kind} {name}"
+        details.append(f"venv: {_tilde(venv)}")
+        m = re.search(r"^home\s*=\s*(.+)$", cfg, re.M)
+        if m:
+            h = m.group(1)
+            pv = re.search(r"\.pyenv/versions/([^/]+)", h)
+            fw = re.search(r"Python\.framework/Versions/([^/]+)", h)
+            details.append("base python: " + (f"pyenv {pv.group(1)}" if pv else f"python.org {fw.group(1)}" if fw
+                           else "Homebrew" if "/opt/homebrew" in h or "/Cellar/" in h else "system" if h.startswith("/usr/bin")
+                           else "uv-managed" if "uv/python" in h else _tilde(h)))
+    elif env.get("CONDA_PREFIX"):
+        manager = "conda " + (env.get("CONDA_DEFAULT_ENV") or os.path.basename(env["CONDA_PREFIX"]))
+    elif any(x in exe for x in ("conda", "miniforge", "mambaforge")):
+        m = re.search(r"/envs/([^/]+)/", exe)
+        manager = "conda " + (m.group(1) if m else "base")
+    else:
+        for pattern, mgr in [(r"\.pyenv/versions/([^/]+)/", "pyenv"), (r"\.nvm/versions/node/v([^/]+)/", "nvm"),
+                             (r"\.asdf/installs/[^/]+/([^/]+)/", "asdf"), (r"mise/installs/[^/]+/([^/]+)/", "mise"),
+                             (r"Python\.framework/Versions/([^/]+)/", "python.org")]:
+            m = re.search(pattern, exe)
+            if m:
+                version, manager = m.group(1), mgr
+                break
+        else:
+            if "/.volta/" in exe: manager = "volta"
+            elif "/fnm" in exe: manager = "fnm"
+            elif exe.startswith(HOME + "/.bun/"): manager = "bun"
+            elif exe.startswith("/opt/homebrew/") or "/Cellar/" in exe: manager = "Homebrew"
+            elif exe.startswith(("/usr/bin/", "/System/", "/Library/Developer/")): manager = "system"
+            elif exe.startswith("/usr/local/"): manager = "nodejs.org" if runtime == "node" else "/usr/local"
+            elif "node_modules/.bin/" in exe: manager = "node_modules"
+            elif exe.startswith(cwd + "/"): manager = "in project"
+    if not version and runtime in KNOWN_RUNTIMES:
+        version = _version_of(exe, runtime)
+    rt = (f"{runtime} {version}" if version else runtime) if (runtime in KNOWN_RUNTIMES or version) else base
+    details.append(f"exec: {_tilde(exe)}")
+    details += [f"{k}={env[k][:80]}" for k in INTERESTING_ENV if env.get(k)]
+    tag = " · ".join(p for p in (rt, manager) if p)
+    _env_cache[entry.pid] = (app, tag, details)
+    entry.app, entry.env_tag, entry.env_details = app, tag, details
 
 
 SKIP_ENV_PREFIXES = ("TERM", "SHLVL", "PWD", "OLDPWD", "_", "__CF", "XPC_", "TMPDIR", "SECURITYSESSIONID", "COMMAND_MODE", "LaunchInstanceID", "SSH_")
@@ -328,7 +456,7 @@ def restart(entry: Entry, here: bool = False) -> str:
     got = proc_args_env(entry.pid)
     if not got:
         return f"cannot read the command line of pid {entry.pid} (only your own processes can be restarted)"
-    argv, env = got
+    _, argv, env = got
     cwd = os.path.expanduser(entry.cwd) if entry.cwd else HOME
     script = write_restart_script(argv, env, cwd, entry.port)
     msg = kill(entry, False)
@@ -357,11 +485,11 @@ def cmd_list(include_system: bool):
         print("nothing listening" + ("" if include_system else " (drop -d to include system/app processes)"))
         return
     probe_all(entries)
-    print(f"{'PORT':>5}  {'ADDR':<15} {'PID':>6}  {'PROCESS':<20} {'ANSWERS':<32} {'CWD / COMMAND'}")
+    print(f"{'PORT':>5}  {'ADDR':<15} {'PID':>6}  {'PROCESS':<18} {'ANSWERS':<30} {'ENV':<30} {'CWD / COMMAND'}")
     for e in entries:
         where = e.cwd or short_cmd(e.cmd, 60)
         pid = "-" if e.container else str(e.pid)
-        print(f"{e.port:>5}  {e.addr:<15} {pid:>6}  {e.name[:20]:<20} {e.label[:32]:<32} {where}")
+        print(f"{e.port:>5}  {e.addr:<15} {pid:>6}  {e.display[:18]:<18} {e.label[:30]:<30} {e.env_tag[:30]:<30} {where}")
 
 
 def find_port(port: int):
@@ -389,6 +517,10 @@ def cmd_who(port: int):
             print(f"  command: {short_cmd(e.cmd, 200)}")
     if e.label:
         print(f"  answers: {e.label}")
+    if e.env_tag:
+        print(f"  env:     {e.env_tag}")
+    for d in e.env_details:
+        print(f"           {d}")
     print(f"  url:     {e.url}")
     print(f"  free it: ports kill {port}")
 
@@ -410,6 +542,38 @@ def cmd_kill(port: int, force: bool):
     print(kill(e, force))
 
 
+EDITOR_APPS = ["Visual Studio Code", "Cursor", "Zed", "Windsurf", "Sublime Text", "PyCharm", "PyCharm CE", "IntelliJ IDEA",
+               "WebStorm", "Fleet", "Positron", "RStudio", "Nova", "TextMate", "BBEdit", "Emacs", "Xcode"]
+
+
+def project_dir(port: int) -> str:
+    e = find_port(port)
+    if e is None:
+        print(f"nothing listening on :{port}", file=sys.stderr)
+        sys.exit(1)
+    if not e.cwd or e.cwd == "/":
+        print(f"no project directory known for :{port} ({e.display})", file=sys.stderr)
+        sys.exit(1)
+    return os.path.expanduser(e.cwd)
+
+
+def open_in_editor(d: str) -> str:
+    app = os.environ.get("PORTS_EDITOR")
+    if not app:
+        app = next((a for a in EDITOR_APPS if any(os.path.isdir(f"{root}/{a}.app") for root in ("/Applications", HOME + "/Applications"))), "")
+    if app:
+        subprocess.run(["open", "-a", app, d], check=False)
+        return f"opened {_tilde(d)} in {app}"
+    ed = os.environ.get("VISUAL") or os.environ.get("EDITOR")
+    if ed:
+        os.execvp("/bin/sh", ["/bin/sh", "-c", f'{ed} "$1"', "sh", d])
+    return "no editor found: set PORTS_EDITOR to an app name, or $EDITOR"
+
+
+def cmd_edit(port: int):
+    print(open_in_editor(project_dir(port)))
+
+
 def cmd_restart(port: int, here: bool):
     e = find_port(port)
     if e is None:
@@ -421,7 +585,7 @@ def cmd_restart(port: int, here: bool):
 # ----------------------------------------------------------------- TUI
 
 
-HELP = "↑↓ move  ⏎/o open  c copy url  k kill  K kill -9  R restart  a all/dev-only  / filter  r refresh  q quit"
+HELP = "↑↓ move  ⏎/o open  c copy  e edit  k kill  K kill -9  R restart  a all/dev  / filter  r refresh  q quit"
 
 
 def tui(stdscr):
@@ -528,7 +692,7 @@ def tui(stdscr):
         name_w = 18
         addr_w = 15
         rest_w = max(10, w - (6 + 2 + addr_w + 1 + 7 + 2 + name_w + 1) - 1)
-        header = f"{'PORT':>6}  {'ADDR':<{addr_w}} {'PID':>7}  {'PROCESS':<{name_w}} {'ANSWERS  ·  CWD  ·  COMMAND'}"
+        header = f"{'PORT':>6}  {'ADDR':<{addr_w}} {'PID':>7}  {'PROCESS':<{name_w}} {'ANSWERS  ·  ENV  ·  CWD  ·  COMMAND'}"
         stdscr.addnstr(1, 0, header, w - 1, curses.A_BOLD)
 
         if not rows:
@@ -541,11 +705,11 @@ def tui(stdscr):
             attr = curses.A_REVERSE if selected else 0
             where = e.cwd
             cmd = short_cmd(e.cmd, rest_w)
-            tail = "  ·  ".join(p for p in (e.label, where, cmd) if p)
+            tail = "  ·  ".join(p for p in (e.label, e.env_tag, where, cmd) if p)
             if len(tail) > rest_w:
                 tail = tail[: rest_w - 1] + "…"
             pid = "-" if e.container else str(e.pid)
-            line = f"{e.port:>6}  {e.addr:<{addr_w}} {pid:>7}  {e.name[:name_w]:<{name_w}} {tail}"
+            line = f"{e.port:>6}  {e.addr:<{addr_w}} {pid:>7}  {e.display[:name_w]:<{name_w}} {tail}"
             if selected:
                 stdscr.addnstr(y, 0, line.ljust(w), w - 1, attr)
             else:
@@ -554,7 +718,7 @@ def tui(stdscr):
                 stdscr.addnstr(y, 8 + addr_w + 1, f"{pid:>7}", w - 9 - addr_w - 1, curses.A_DIM)
                 x = 8 + addr_w + 1 + 7 + 2
                 if x < w - 1:
-                    stdscr.addnstr(y, x, f"{e.name[:name_w]:<{name_w}}", w - x - 1, curses.color_pair(1) if e.container else curses.color_pair(2) if e.system else curses.color_pair(3))
+                    stdscr.addnstr(y, x, f"{e.display[:name_w]:<{name_w}}", w - x - 1, curses.color_pair(1) if e.container else curses.color_pair(2) if e.system else curses.color_pair(3))
                 x += name_w + 1
                 if x < w - 1:
                     stdscr.addnstr(y, x, tail, w - x - 1)
@@ -597,6 +761,12 @@ def tui(stdscr):
             if ask(f"Force {'stop' if e.container else 'kill (-9)'} {e.name} on :{e.port}?"):
                 set_status(kill(e, True))
                 refresh_data()
+        elif ch == ord("e") and rows:
+            e = rows[sel]
+            if e.cwd and e.cwd != "/":
+                set_status(open_in_editor(os.path.expanduser(e.cwd)))
+            else:
+                set_status("no project directory known")
         elif ch == ord("R") and rows:
             e = rows[sel]
             if ask(f"Restart {e.name} on :{e.port} in a new Terminal window?"):
@@ -632,6 +802,10 @@ def main(argv):
         cmd_open(int(args[1]))
     elif sub in ("kill", "k") and len(args) >= 2 and args[1].isdigit():
         cmd_kill(int(args[1]), "-9" in args or "--force" in args)
+    elif sub in ("edit", "e") and len(args) >= 2 and args[1].isdigit():
+        cmd_edit(int(args[1]))
+    elif sub in ("dir", "cd") and len(args) >= 2 and args[1].isdigit():
+        print(project_dir(int(args[1])))
     elif sub in ("restart", "rs") and len(args) >= 2 and args[1].isdigit():
         cmd_restart(int(args[1]), "--here" in args)
     elif sub in ("-h", "--help", "help"):

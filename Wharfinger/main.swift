@@ -4,6 +4,7 @@
 import AppKit
 import Carbon.HIToolbox
 import ServiceManagement
+import UniformTypeIdentifiers
 import UserNotifications
 
 let home = NSHomeDirectory()
@@ -25,8 +26,11 @@ struct Entry {
     let cmd: String
     let cwd: String
     let system: Bool
+    var info: EnvInfo? = nil
 
     var key: String { "\(pid):\(port)" }
+    /// What to call it in the list: the app we recognised (uvicorn, Vite, Jupyter …) or the process name.
+    var display: String { info?.app ?? name }
     var url: String { "http://\(localAddrs.contains(addr) ? "localhost" : addr):\(port)" }
 
     var shortCmd: String {
@@ -75,6 +79,9 @@ func tilde(_ s: String) -> String {
 
 func isSystem(cmd: String, name: String) -> Bool {
     let exe = cmd.isEmpty ? name : String(cmd.split(separator: " ", maxSplits: 1)[0])
+    // Language runtimes installed as frameworks (python.org's Python.framework, R.framework …) are dev, not system,
+    // even though they live under /Library and launch through an embedded .app.
+    if exe.contains("/Frameworks/") && exe.contains(".framework/") { return false }
     if exe.contains(".app/Contents/") { return true }
     return systemPrefixes.contains { exe.hasPrefix($0) }
 }
@@ -96,7 +103,7 @@ func collect() -> [Entry] {
             let addr = String(val[..<colon])
             let key = "\(pid):\(port)"
             // IPv4 + IPv6 on the same port collapse to one row; prefer the wildcard.
-            if let existing = seen[key], ["*", "0.0.0.0", "::"].contains(existing.addr) { continue }
+            if seen[key] != nil, !["*", "0.0.0.0", "::"].contains(addr) { continue }   // keep the first (IPv4) row
             if seen[key] == nil { order.append(key) }
             seen[key] = (port, addr, pid, name)
         default: break
@@ -123,15 +130,195 @@ func collect() -> [Entry] {
     return order.map { key -> Entry in
         let s = seen[key]!
         let cmd = cmds[s.pid] ?? ""
-        return Entry(port: s.port, addr: s.addr, pid: s.pid, name: s.name, cmd: cmd,
-                     cwd: tilde(cwds[s.pid] ?? ""), system: isSystem(cmd: cmd, name: s.name))
+        var e = Entry(port: s.port, addr: s.addr, pid: s.pid, name: s.name, cmd: cmd,
+                      cwd: tilde(cwds[s.pid] ?? ""), system: isSystem(cmd: cmd, name: s.name))
+        if !e.system { e.info = describeEnv(pid: e.pid, cwd: e.cwd) }
+        return e
     }.sorted { $0.port == $1.port ? $0.pid < $1.pid : $0.port < $1.port }
+}
+
+// MARK: - Environment per process
+
+struct EnvInfo {
+    var app: String? = nil          // recognised program: uvicorn, Vite, Jupyter kernel …
+    var runtime = ""                // "python 3.12.3", "node 20.11.0"
+    var manager = ""                // ".venv", "pyenv", "nvm", "Homebrew", "system" …
+    var exe = ""                    // resolved executable path
+    var details: [String] = []      // extra lines for the submenu
+    var tag: String { [runtime, manager].filter { !$0.isEmpty }.joined(separator: " · ") }
+}
+
+let envLock = NSLock()
+var envCache: [Int32: EnvInfo] = [:]
+var versionCache: [String: String] = [:]
+let knownRuntimes: Set<String> = ["python", "node", "bun", "deno", "ruby", "php", "java", "perl", "elixir", "julia", "R"]
+let interestingEnv = ["NODE_ENV", "PORT", "HOST", "DJANGO_SETTINGS_MODULE", "FLASK_APP", "FLASK_ENV", "FLASK_DEBUG", "RAILS_ENV", "RACK_ENV",
+                      "MIX_ENV", "APP_ENV", "ENV", "ENVIRONMENT", "DEBUG", "PYTHONPATH", "CONDA_DEFAULT_ENV", "JUPYTER_CONFIG_DIR"]
+
+func runBoth(_ path: String, _ args: [String]) -> String {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: path)
+    p.arguments = args
+    let pipe = Pipe()
+    p.standardOutput = pipe
+    p.standardError = pipe
+    do { try p.run() } catch { return "" }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    p.waitUntilExit()
+    return String(decoding: data, as: UTF8.self)
+}
+
+func firstMatch(_ pattern: String, _ text: String) -> String? {
+    guard let re = try? NSRegularExpression(pattern: pattern),
+          let m = re.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+          m.numberOfRanges > 1, let r = Range(m.range(at: 1), in: text) else { return nil }
+    return String(text[r])
+}
+
+func versionOf(_ exe: String, runtime: String) -> String {
+    envLock.lock(); if let v = versionCache[exe] { envLock.unlock(); return v }; envLock.unlock()
+    let out = runBoth(exe, [runtime == "java" ? "-version" : "--version"])
+    let v = firstMatch(#"(\d+\.\d+(?:\.\d+)?)"#, out) ?? ""
+    envLock.lock(); versionCache[exe] = v; envLock.unlock()
+    return v
+}
+
+func runtimeName(_ base: String) -> String {
+    if firstMatch(#"^(python)\d*(?:\.\d+)?$"#, base) != nil { return "python" }
+    if firstMatch(#"^(ruby)\d*(?:\.\d+)?$"#, base) != nil { return "ruby" }
+    if firstMatch(#"^(php)\d*(?:\.\d+)?$"#, base) != nil { return "php" }
+    if base == "node" || base == "nodejs" { return "node" }
+    return base
+}
+
+func describeEnv(pid: Int32, cwd: String) -> EnvInfo? {
+    envLock.lock(); if let c = envCache[pid] { envLock.unlock(); return c }; envLock.unlock()
+    guard let (execPath, argv, env) = procArgsEnv(pid) else { return nil }
+    var info = EnvInfo()
+    let absCwd = ((cwd.hasPrefix("~") ? home + cwd.dropFirst() : cwd) as NSString).resolvingSymlinksInPath
+    var exe = execPath.hasPrefix("/") ? execPath : (absCwd + "/" + execPath)
+    exe = (exe as NSString).standardizingPath   // keep symlinks: <venv>/bin/python must stay the venv path
+    info.exe = exe
+    let base = (exe as NSString).lastPathComponent
+    let runtime = runtimeName(base.lowercased())
+    var version = ""
+    let joined = argv.joined(separator: " ")
+
+    // Which program is it really? (argv beats the interpreter name)
+    let apps: [(String, String)] = [
+        ("ipykernel_launcher", "Jupyter kernel"), ("jupyter-lab", "JupyterLab"), ("jupyter lab", "JupyterLab"), ("jupyterlab", "JupyterLab"),
+        ("jupyter-notebook", "Jupyter Notebook"), ("jupyter notebook", "Jupyter Notebook"), ("jupyter", "Jupyter"),
+        ("uvicorn", "uvicorn"), ("gunicorn", "gunicorn"), ("hypercorn", "hypercorn"), ("manage.py runserver", "Django runserver"),
+        ("flask", "Flask"), ("streamlit", "Streamlit"), ("gradio", "Gradio"), ("mkdocs", "MkDocs"), ("http.server", "http.server"),
+        ("vite", "Vite"), ("next", "Next.js"), ("nuxt", "Nuxt"), ("astro", "Astro"), ("remix", "Remix"), ("webpack", "webpack"),
+        ("storybook", "Storybook"), ("nodemon", "nodemon"), ("ts-node", "ts-node"), ("tsx", "tsx"), ("rails", "Rails"), ("puma", "Puma"),
+        ("php artisan serve", "Laravel"), ("mix phx.server", "Phoenix"), ("hugo", "Hugo"), ("jekyll", "Jekyll"), ("ollama", "Ollama"),
+    ]
+    let argvLower = joined.lowercased()
+    for (needle, name) in apps {
+        // match on whole path components / words so "next" doesn't match "nextcloud-foo"
+        if let _ = firstMatch("(^|[/ ])(" + NSRegularExpression.escapedPattern(for: needle.lowercased()) + ")($|[ /.])", argvLower) {
+            info.app = name; break
+        }
+    }
+
+    // Python virtualenv: VIRTUAL_ENV or <venv>/bin/python with a pyvenv.cfg next to bin/
+    let binDir = (exe as NSString).deletingLastPathComponent
+    let venvDir = ((env["VIRTUAL_ENV"] ?? ((binDir as NSString).lastPathComponent == "bin" ? (binDir as NSString).deletingLastPathComponent : "")) as NSString).resolvingSymlinksInPath
+    if runtime == "python", !venvDir.isEmpty, let cfg = try? String(contentsOfFile: venvDir + "/pyvenv.cfg", encoding: .utf8) {
+        version = firstMatch(#"(?m)^version(?:_info)?\s*=\s*(\d+\.\d+(?:\.\d+)?)"#, cfg) ?? ""
+        let name = venvDir.hasPrefix(absCwd + "/") ? String(venvDir.dropFirst(absCwd.count + 1)) : tilde(venvDir)
+        var kind = "venv"
+        if cfg.contains("\nuv = ") || cfg.hasPrefix("uv = ") { kind = "uv venv" }
+        else if venvDir.contains("pypoetry/virtualenvs") { kind = "poetry venv" }
+        else if venvDir.contains("/.virtualenvs/") || env["PIPENV_ACTIVE"] != nil { kind = "virtualenv" }
+        info.manager = "\(kind) \(name)"
+        info.details.append("venv: \(tilde(venvDir))")
+        if let home = firstMatch(#"(?m)^home\s*=\s*(.+)$"#, cfg) {
+            if let v = firstMatch(#"\.pyenv/versions/([^/]+)"#, home) { info.details.append("base python: pyenv \(v)") }
+            else if let v = firstMatch(#"Python\.framework/Versions/([^/]+)"#, home) { info.details.append("base python: python.org \(v)") }
+            else if home.contains("/opt/homebrew") || home.contains("/Cellar/") { info.details.append("base python: Homebrew") }
+            else if home.hasPrefix("/usr/bin") || home.hasPrefix("/Library/Developer") { info.details.append("base python: system") }
+            else if home.contains("uv/python") { info.details.append("base python: uv-managed") }
+            else { info.details.append("base python: \(tilde(home))") }
+        }
+    } else if let prefix = env["CONDA_PREFIX"], !prefix.isEmpty {
+        info.manager = "conda " + (env["CONDA_DEFAULT_ENV"] ?? (prefix as NSString).lastPathComponent)
+        info.details.append("conda prefix: \(tilde(prefix))")
+    } else if exe.contains("conda") || exe.contains("miniforge") || exe.contains("mambaforge") {
+        info.manager = "conda " + ((firstMatch(#"/envs/([^/]+)/"#, exe)) ?? "base")
+    } else if let v = firstMatch(#"\.pyenv/versions/([^/]+)/"#, exe) {
+        version = v; info.manager = "pyenv"
+    } else if let v = firstMatch(#"\.nvm/versions/node/v([^/]+)/"#, exe) {
+        version = v; info.manager = "nvm"
+    } else if let v = firstMatch(#"\.asdf/installs/[^/]+/([^/]+)/"#, exe) {
+        version = v; info.manager = "asdf"
+    } else if let v = firstMatch(#"mise/installs/[^/]+/([^/]+)/"#, exe) {
+        version = v; info.manager = "mise"
+    } else if let v = firstMatch(#"Python\.framework/Versions/([^/]+)/"#, exe) {
+        version = v; info.manager = "python.org"
+    } else if exe.contains("/.volta/") { info.manager = "volta" }
+    else if exe.contains("/fnm") { info.manager = "fnm" }
+    else if exe.hasPrefix(home + "/.bun/") { info.manager = "bun" }
+    else if exe.hasPrefix(home + "/.deno/") { info.manager = "deno" }
+    else if exe.hasPrefix("/opt/homebrew/") || exe.contains("/Cellar/") { info.manager = "Homebrew" }
+    else if exe.hasPrefix("/usr/bin/") || exe.hasPrefix("/System/") || exe.hasPrefix("/Library/Developer/") { info.manager = "system" }
+    else if exe.hasPrefix("/usr/local/") { info.manager = runtime == "node" ? "nodejs.org" : "/usr/local" }
+    else if exe.contains("node_modules/.bin/") { info.manager = "node_modules" }
+    else if exe.hasPrefix(absCwd + "/") { info.manager = "in project" }
+
+    if version.isEmpty, knownRuntimes.contains(runtime) { version = versionOf(exe, runtime: runtime) }
+    if knownRuntimes.contains(runtime) || !version.isEmpty {
+        info.runtime = version.isEmpty ? runtime : "\(runtime) \(version)"
+    } else {
+        info.runtime = base
+    }
+    info.details.append("exec: \(tilde(exe))")
+    for k in interestingEnv { if let v = env[k], !v.isEmpty { info.details.append("\(k)=\(v.prefix(80))") } }
+
+    envLock.lock(); envCache[pid] = info; envLock.unlock()
+    return info
+}
+
+// MARK: - Editors & terminals
+
+let editorCandidates: [(name: String, apps: [String])] = [
+    ("Visual Studio Code", ["Visual Studio Code.app"]), ("Cursor", ["Cursor.app"]), ("Zed", ["Zed.app"]), ("Windsurf", ["Windsurf.app"]),
+    ("Sublime Text", ["Sublime Text.app"]), ("PyCharm", ["PyCharm.app", "PyCharm CE.app", "PyCharm Professional.app", "PyCharm Community Edition.app"]),
+    ("IntelliJ IDEA", ["IntelliJ IDEA.app", "IntelliJ IDEA CE.app"]), ("WebStorm", ["WebStorm.app"]), ("RustRover", ["RustRover.app"]),
+    ("GoLand", ["GoLand.app"]), ("Fleet", ["Fleet.app"]), ("Positron", ["Positron.app"]), ("RStudio", ["RStudio.app"]),
+    ("Nova", ["Nova.app"]), ("TextMate", ["TextMate.app"]), ("BBEdit", ["BBEdit.app"]), ("Emacs", ["Emacs.app"]), ("Xcode", ["Xcode.app"]),
+]
+let terminalCandidates: [(name: String, apps: [String])] = [
+    ("Terminal", ["/System/Applications/Utilities/Terminal.app"]), ("iTerm", ["iTerm.app"]), ("Ghostty", ["Ghostty.app"]),
+    ("Warp", ["Warp.app"]), ("kitty", ["kitty.app"]), ("Alacritty", ["Alacritty.app"]), ("WezTerm", ["WezTerm.app"]),
+]
+
+func installedApps(_ candidates: [(name: String, apps: [String])]) -> [String] {
+    candidates.filter { c in
+        c.apps.contains { app in
+            app.hasPrefix("/") ? FileManager.default.fileExists(atPath: app)
+                : ["/Applications/", home + "/Applications/", home + "/Applications/JetBrains Toolbox/"].contains { FileManager.default.fileExists(atPath: $0 + app) }
+        }
+    }.map { $0.name }
+}
+
+func openInTerminal(_ name: String, dir: String) {
+    var args = ["-a", name]
+    switch name {
+    case "Ghostty": args += ["--args", "--working-directory=\(dir)"]
+    case "kitty": args += ["--args", "-d", dir]
+    case "Alacritty": args += ["--args", "--working-directory", dir]
+    case "WezTerm": args += ["--args", "start", "--cwd", dir]
+    default: args.append(dir)     // Terminal, iTerm, Warp open a window at the folder
+    }
+    _ = run("/usr/bin/open", args)
 }
 
 // MARK: - Restart
 
-/// Exact argv and environment of one of our own processes (KERN_PROCARGS2).
-func procArgsEnv(_ pid: Int32) -> (argv: [String], env: [String: String])? {
+/// Exact exec path, argv and environment of one of our own processes (KERN_PROCARGS2).
+func procArgsEnv(_ pid: Int32) -> (execPath: String, argv: [String], env: [String: String])? {
     var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
     var size = 0
     guard sysctl(&mib, 3, nil, &size, nil, 0) == 0, size > 4 else { return nil }
@@ -139,7 +326,9 @@ func procArgsEnv(_ pid: Int32) -> (argv: [String], env: [String: String])? {
     guard sysctl(&mib, 3, &buf, &size, nil, 0) == 0 else { return nil }
     let argc = Int(buf.withUnsafeBytes { $0.load(as: Int32.self) })
     var i = 4
+    let execStart = i
     while i < size, buf[i] != 0 { i += 1 }        // exec path
+    let execPath = String(decoding: buf[execStart..<i], as: UTF8.self)
     while i < size, buf[i] == 0 { i += 1 }        // padding
     var strings: [String] = []
     var start = i
@@ -155,7 +344,7 @@ func procArgsEnv(_ pid: Int32) -> (argv: [String], env: [String: String])? {
     for s in strings[argc...] {
         if let eq = s.firstIndex(of: "=") { env[String(s[..<eq])] = String(s[s.index(after: eq)...]) }
     }
-    return (Array(strings[..<argc]), env)
+    return (execPath, Array(strings[..<argc]), env)
 }
 
 func shQuote(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
@@ -262,7 +451,7 @@ final class Prober {
             ("Storybook", { lower.contains("storybook") }),
             ("Streamlit", { lower.contains("streamlit") }),
             ("Gradio", { lower.contains("gradio") }),
-            ("Jupyter", { lower.contains("jupyter") }),
+            ("Jupyter", { lower.contains("jupyter-config-data") || lower.contains("jupyterlab") || lower.contains("/static/notebook/") }),
             ("Ollama", { lower.contains("ollama is running") }),
             ("Grafana", { lower.contains("grafana") }),
             ("Swagger UI", { lower.contains("swagger-ui") }),
@@ -336,6 +525,15 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
         set { UserDefaults.standard.set(newValue, forKey: "icon"); applyIcon() }
     }
 
+    var editor: String {
+        get { UserDefaults.standard.string(forKey: "editor") ?? installedApps(editorCandidates).first ?? "" }
+        set { UserDefaults.standard.set(newValue, forKey: "editor") }
+    }
+    var terminal: String {
+        get { UserDefaults.standard.string(forKey: "terminal") ?? "Terminal" }
+        set { UserDefaults.standard.set(newValue, forKey: "terminal") }
+    }
+
     func applyIcon() {
         let img = NSImage(systemSymbolName: iconSymbol, accessibilityDescription: "Wharfinger")
             ?? NSImage(systemSymbolName: "network", accessibilityDescription: "Wharfinger")
@@ -371,7 +569,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
     func apply(entries e: [Entry], containers c: [Container]) {
         entries = e
         containers = c
-        dbg("refresh: \(e.count) listeners, \(c.count) containers, dev: " + devEntries().map { ":\($0.port) \($0.name)" }.joined(separator: ", "))
+        dbg("refresh: \(e.count) listeners, \(c.count) containers, dev: " + devEntries().map { ":\($0.port) \($0.display) [\($0.info?.tag ?? "")]" }.joined(separator: ", "))
         let dev = devEntries()
         let n = dev.count + containers.count
         item.button?.title = n > 0 ? " \(n)" : ""
@@ -462,6 +660,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
         refreshSync()
         menu.removeAllItems()
         menuItems.removeAll()
+        rowGroups.removeAll()
         let dev = devEntries()
         let devKeys = Set(dev.map { $0.key })
         let other = entries.filter { !devKeys.contains($0.key) }
@@ -470,7 +669,17 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
             menu.addItem(header("No dev servers listening"))
         } else {
             menu.addItem(header("Dev servers"))
-            dev.forEach { menu.addItem(entryItem($0)) }
+            // A process with many ports (a Jupyter kernel has five) becomes one row.
+            var groups: [[Entry]] = []
+            for e in dev {
+                if let i = groups.firstIndex(where: { $0[0].pid == e.pid }), groups[i].count + 1 >= 3 || groups[i].count >= 3 { groups[i].append(e) }
+                else { groups.append([e]) }
+            }
+            var merged: [[Entry]] = []
+            for g in groups {
+                if g.count >= 3 { merged.append(g) } else { g.forEach { merged.append([$0]) } }
+            }
+            merged.forEach { menu.addItem(entryItem($0)) }
         }
         if !containers.isEmpty {
             menu.addItem(.separator())
@@ -480,8 +689,14 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
         menu.addItem(.separator())
         if !other.isEmpty {
             let sub = NSMenu()
-            other.forEach { sub.addItem(entryItem($0)) }
-            let it = NSMenuItem(title: "Apps & system (\(other.count))", action: nil, keyEquivalent: "")
+            // One row per program, its ports in the submenu.
+            var byPid: [[Entry]] = []
+            for e in other {
+                if let i = byPid.firstIndex(where: { $0[0].pid == e.pid }) { byPid[i].append(e) } else { byPid.append([e]) }
+            }
+            byPid.sort { $0[0].name.lowercased() < $1[0].name.lowercased() }
+            byPid.forEach { sub.addItem(entryItem($0)) }
+            let it = NSMenuItem(title: "Apps & system (\(byPid.count) apps, \(other.count) ports)", action: nil, keyEquivalent: "")
             it.submenu = sub
             menu.addItem(it)
         }
@@ -509,6 +724,42 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
         let iconItem = NSMenuItem(title: "Icon", action: nil, keyEquivalent: "")
         iconItem.submenu = icons
         menu.addItem(iconItem)
+        let editors = NSMenu()
+        for name in installedApps(editorCandidates) {
+            let m = NSMenuItem(title: name, action: #selector(chooseEditor(_:)), keyEquivalent: "")
+            m.target = self; m.representedObject = name; m.state = name == editor ? .on : .off
+            editors.addItem(m)
+        }
+        if !editor.isEmpty, !installedApps(editorCandidates).contains(editor) {
+            let m = NSMenuItem(title: editor, action: #selector(chooseEditor(_:)), keyEquivalent: "")
+            m.target = self; m.representedObject = editor; m.state = .on
+            editors.addItem(m)
+        }
+        editors.addItem(.separator())
+        let pick = NSMenuItem(title: "Choose another app…", action: #selector(pickEditor), keyEquivalent: "")
+        pick.target = self
+        editors.addItem(pick)
+        let editorItem = NSMenuItem(title: "Editor", action: nil, keyEquivalent: "")
+        editorItem.submenu = editors
+        menu.addItem(editorItem)
+        let terminals = NSMenu()
+        for name in installedApps(terminalCandidates) {
+            let m = NSMenuItem(title: name, action: #selector(chooseTerminal(_:)), keyEquivalent: "")
+            m.target = self; m.representedObject = name; m.state = name == terminal ? .on : .off
+            terminals.addItem(m)
+        }
+        if !installedApps(terminalCandidates).contains(terminal) {
+            let m = NSMenuItem(title: terminal, action: #selector(chooseTerminal(_:)), keyEquivalent: "")
+            m.target = self; m.representedObject = terminal; m.state = .on
+            terminals.addItem(m)
+        }
+        terminals.addItem(.separator())
+        let pickT = NSMenuItem(title: "Choose another app…", action: #selector(pickTerminal), keyEquivalent: "")
+        pickT.target = self
+        terminals.addItem(pickT)
+        let termItem = NSMenuItem(title: "Terminal", action: nil, keyEquivalent: "")
+        termItem.submenu = terminals
+        menu.addItem(termItem)
         menu.addItem(header("⌃⌥P opens this menu anywhere"))
         menu.addItem(withTitle: "Quit Wharfinger", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
     }
@@ -523,7 +774,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
     let small = NSFont.menuFont(ofSize: NSFont.smallSystemFontSize)
 
     func rowTitle(port: String, name: String, probe: String?, detail: String) -> NSAttributedString {
-        let t = NSMutableAttributedString(string: port.padding(toLength: 7, withPad: " ", startingAt: 0), attributes: [.font: mono])
+        let t = NSMutableAttributedString(string: port.isEmpty ? "" : port.padding(toLength: 7, withPad: " ", startingAt: 0), attributes: [.font: mono])
         t.append(NSAttributedString(string: name, attributes: [.font: NSFont.menuFont(ofSize: 0)]))
         if let p = probe, !p.isEmpty {
             t.append(NSAttributedString(string: "   \(p)", attributes: [.font: small, .foregroundColor: NSColor.labelColor]))
@@ -534,34 +785,77 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
         return t
     }
 
+    func entryTitle(_ group: [Entry]) -> NSAttributedString {
+        let e = group[0]
+        if e.system {
+            let ports = group.map { ":\($0.port)" }.joined(separator: " ")
+            return rowTitle(port: "", name: e.name, probe: nil, detail: ports)
+        }
+        let port = group.count > 1 ? ":\(e.port) +\(group.count - 1)" : ":\(e.port)"
+        let probe = group.compactMap { prober.label($0.key) }.first { !$0.isEmpty }
+        var detail = e.info?.tag ?? ""
+        if e.cwd != "/" && !e.cwd.isEmpty { detail += (detail.isEmpty ? "" : "   ") + e.cwd }
+        return rowTitle(port: port, name: e.display, probe: probe, detail: detail)
+    }
+
     func updateRow(_ key: String) {
         guard let it = menuItems[key] else { return }
         if let box = it.representedObject as? Box {
-            if let e = box.entry {
-                it.attributedTitle = rowTitle(port: ":\(e.port)", name: e.name, probe: prober.label(e.key), detail: e.cwd == "/" ? "" : e.cwd)
+            if box.entry != nil, let group = it.representedObject.flatMap({ _ in rowGroups[key] }) {
+                it.attributedTitle = entryTitle(group)
             } else if let c = box.container {
                 it.attributedTitle = containerTitle(c)
             }
         }
     }
 
-    func entryItem(_ e: Entry) -> NSMenuItem {
+    var rowGroups: [String: [Entry]] = [:]
+
+    func entryItem(_ group: [Entry]) -> NSMenuItem {
+        let e = group[0]
         let it = NSMenuItem(title: "", action: nil, keyEquivalent: "")
-        it.attributedTitle = rowTitle(port: ":\(e.port)", name: e.name, probe: prober.label(e.key), detail: e.cwd == "/" ? "" : e.cwd)
+        it.attributedTitle = entryTitle(group)
         let box = Box(e)
         it.representedObject = box
-        menuItems[e.key] = it
+        for g in group { menuItems[g.key] = it; rowGroups[g.key] = group }
 
         let sub = NSMenu()
-        sub.addItem(action("Open \(e.url)", #selector(openURL(_:)), box))
-        sub.addItem(action("Copy URL", #selector(copyURL(_:)), box))
+        for g in group {
+            let b = Box(g)
+            sub.addItem(action("Open \(g.url)", #selector(openURL(_:)), b))
+        }
+        sub.addItem(action(group.count > 1 ? "Copy URL (:\(e.port))" : "Copy URL", #selector(copyURL(_:)), box))
         sub.addItem(.separator())
+        let hasDir = !e.cwd.isEmpty && e.cwd != "/"
+        if hasDir {
+            if !editor.isEmpty { sub.addItem(action("Open project in \(editor)", #selector(openInEditor(_:)), box)) }
+            let others = installedApps(editorCandidates).filter { $0 != editor }
+            if !others.isEmpty {
+                let m = NSMenuItem(title: "Open project in…", action: nil, keyEquivalent: "")
+                let om = NSMenu()
+                for name in others {
+                    let a = action(name, #selector(openInNamedEditor(_:)), box)
+                    a.representedObject = [box, name] as [Any]
+                    om.addItem(a)
+                }
+                m.submenu = om
+                sub.addItem(m)
+            }
+            sub.addItem(action("Open project in \(terminal)", #selector(openInTerm(_:)), box))
+            sub.addItem(action("Reveal project in Finder", #selector(revealInFinder(_:)), box))
+            sub.addItem(.separator())
+        }
         sub.addItem(action("Restart (in a new Terminal window)", #selector(restart(_:)), box))
         sub.addItem(action("Kill (SIGTERM)", #selector(killTerm(_:)), box))
         sub.addItem(action("Force Kill (SIGKILL)", #selector(killForce(_:)), box))
         sub.addItem(.separator())
-        sub.addItem(header("pid \(e.pid)  ·  \(e.addr):\(e.port)"))
-        if !e.shortCmd.isEmpty { sub.addItem(header(String(e.shortCmd.prefix(90)))) }
+        let ports = group.map { "\($0.addr):\($0.port)" }.joined(separator: ", ")
+        sub.addItem(header("\(e.name)  ·  pid \(e.pid)  ·  \(ports.prefix(80))"))
+        if let info = e.info {
+            if !info.tag.isEmpty { sub.addItem(header(info.tag)) }
+            for d in info.details { sub.addItem(header(String(d.prefix(100)))) }
+        }
+        if !e.shortCmd.isEmpty { sub.addItem(header(String(e.shortCmd.prefix(100)))) }
         it.submenu = sub
         return it
     }
@@ -640,6 +934,55 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { self.refreshAsync() }
     }
 
+    func projectDir(_ sender: Any?) -> String? {
+        guard let e = (box(sender) ?? ((sender as? NSMenuItem)?.representedObject as? [Any])?.first as? Box)?.entry,
+              !e.cwd.isEmpty, e.cwd != "/" else { return nil }
+        return e.cwd.hasPrefix("~") ? home + e.cwd.dropFirst() : e.cwd
+    }
+
+    @objc func openInEditor(_ sender: Any?) {
+        guard let dir = projectDir(sender), !editor.isEmpty else { return }
+        _ = run("/usr/bin/open", ["-a", editor, dir])
+    }
+
+    @objc func openInNamedEditor(_ sender: Any?) {
+        guard let dir = projectDir(sender), let pair = (sender as? NSMenuItem)?.representedObject as? [Any], let name = pair.last as? String else { return }
+        _ = run("/usr/bin/open", ["-a", name, dir])
+    }
+
+    @objc func openInTerm(_ sender: Any?) {
+        guard let dir = projectDir(sender) else { return }
+        openInTerminal(terminal, dir: dir)
+    }
+
+    @objc func revealInFinder(_ sender: Any?) {
+        guard let dir = projectDir(sender) else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: dir)])
+    }
+
+    func pickApp() -> String? {
+        NSApp.activate(ignoringOtherApps: true)
+        let panel = NSOpenPanel()
+        panel.title = "Choose an application"
+        panel.directoryURL = URL(fileURLWithPath: "/Applications")
+        panel.allowedContentTypes = [.applicationBundle]
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return nil }
+        return url.deletingPathExtension().lastPathComponent
+    }
+
+    @objc func pickEditor() { if let name = pickApp() { editor = name } }
+    @objc func pickTerminal() { if let name = pickApp() { terminal = name } }
+
+    @objc func chooseEditor(_ sender: Any?) {
+        if let s = (sender as? NSMenuItem)?.representedObject as? String { editor = s }
+    }
+
+    @objc func chooseTerminal(_ sender: Any?) {
+        if let s = (sender as? NSMenuItem)?.representedObject as? String { terminal = s }
+    }
+
     @objc func chooseIcon(_ sender: Any?) {
         if let s = (sender as? NSMenuItem)?.representedObject as? String { iconSymbol = s }
     }
@@ -647,7 +990,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
     @objc func restart(_ sender: Any?) {
         guard let e = box(sender)?.entry else { return }
         NSApp.activate(ignoringOtherApps: true)
-        guard let (argv, env) = procArgsEnv(e.pid) else {
+        guard let (_, argv, env) = procArgsEnv(e.pid) else {
             let a = NSAlert()
             a.messageText = "Cannot read the command line of pid \(e.pid)"
             a.informativeText = "Only your own processes can be restarted."
@@ -702,6 +1045,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
             var info = "\(e.addr):\(e.port)"
             if !e.cwd.isEmpty && e.cwd != "/" { info += "\n\(e.cwd)" }
             if !e.shortCmd.isEmpty { info += "\n\(e.shortCmd.prefix(200))" }
+            if let i = e.info ?? describeEnv(pid: e.pid, cwd: e.cwd), !i.tag.isEmpty { info += "\n\(i.tag)" }
             if let c = containers.first(where: { $0.ports.contains { $0.host == port } }) { info += "\nDocker container: \(c.name) (\(c.image))" }
             r.informativeText = info
             r.addButton(withTitle: "Open")
