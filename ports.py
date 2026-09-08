@@ -12,6 +12,9 @@ Usage:
   ports edit PORT       open the project directory in your editor ($PORTS_EDITOR app name,
                         else VS Code / Cursor / Zed …, else $VISUAL / $EDITOR)
   ports dir PORT        print the project directory, for: cd "$(ports dir 3000)"
+  ports recent          dev servers seen before that are not running now
+  ports start PORT      start a remembered server again (same command, cwd and env);
+                        --here runs it in this terminal instead of a new Terminal window
 
 Docker containers with published ports are listed too, when the daemon runs.
 Each dev server is probed with one HTTP GET to show the framework / page title.
@@ -61,6 +64,9 @@ class Entry:
     container: str = ""   # docker container id, when this row is a container
     label: str = ""       # what answered the HTTP probe
     app: str = ""         # recognised program (uvicorn, Vite, Jupyter kernel …)
+    branch: str = ""      # git branch of the project directory
+    argv: list = field(default_factory=list)
+    env: dict = field(default_factory=dict)
     env_tag: str = ""     # "python 3.12.3 · venv .venv"
     env_details: list = field(default_factory=list)
 
@@ -153,6 +159,8 @@ def collect(include_system: bool = True):
         if include_system or not e.system:
             if not e.system:
                 describe_env(e)
+                if e.cwd and e.cwd != "/":
+                    e.branch = git_branch(e.cwd)
             entries.append(e)
 
     entries.sort(key=lambda e: (e.port, e.pid))
@@ -185,6 +193,7 @@ def collect_all(include_system: bool = True):
     docker_ports = {e.port for e in docker}
     procs = [e for e in collect(include_system)
              if not (e.port in docker_ports and "docker" in e.name.lower())]
+    remember(procs)
     return sorted(procs + docker, key=lambda e: (e.port, e.pid))
 
 
@@ -355,12 +364,14 @@ def _runtime_name(base: str) -> str:
 def describe_env(entry: Entry):
     """Fill entry.app / env_tag / env_details from the process' exec path, argv and environment."""
     if entry.pid in _env_cache:
-        entry.app, entry.env_tag, entry.env_details = _env_cache[entry.pid]
+        entry.app, entry.env_tag, entry.env_details, entry.argv, entry.env = _env_cache[entry.pid]
         return
     got = proc_args_env(entry.pid)
     if not got:
         return
     exec_path, argv, env = got
+    entry.argv = argv
+    entry.env = {k: v for k, v in env.items() if not k.startswith(SKIP_ENV_PREFIXES)}
     cwd = os.path.realpath(os.path.expanduser(entry.cwd)) if entry.cwd else HOME
     exe = os.path.normpath(exec_path if exec_path.startswith("/") else os.path.join(cwd, exec_path))  # keep symlinks
     base = os.path.basename(exe)
@@ -421,8 +432,126 @@ def describe_env(entry: Entry):
     details.append(f"exec: {_tilde(exe)}")
     details += [f"{k}={env[k][:80]}" for k in INTERESTING_ENV if env.get(k)]
     tag = " · ".join(p for p in (rt, manager) if p)
-    _env_cache[entry.pid] = (app, tag, details)
+    _env_cache[entry.pid] = (app, tag, details, entry.argv, entry.env)
     entry.app, entry.env_tag, entry.env_details = app, tag, details
+
+
+def git_branch(d: str) -> str:
+    """Branch checked out in d or its nearest parent repo; handles worktrees and detached HEADs."""
+    d = os.path.expanduser(d)
+    for _ in range(12):
+        dot = os.path.join(d, ".git")
+        gitdir = ""
+        if os.path.isdir(dot):
+            gitdir = dot
+        elif os.path.isfile(dot):
+            line = open(dot).read().strip()
+            if line.startswith("gitdir:"):
+                g = line[7:].strip()
+                gitdir = g if g.startswith("/") else os.path.join(d, g)
+        if gitdir:
+            try:
+                head = open(os.path.join(gitdir, "HEAD")).read().strip()
+            except OSError:
+                return ""
+            return head[16:] if head.startswith("ref: refs/heads/") else head[5:] if head.startswith("ref: ") else head[:7]
+        parent = os.path.dirname(d)
+        if parent in (d, "", "/", HOME):
+            break
+        d = parent
+    return ""
+
+
+KNOWN_ROUTES = {
+    "FastAPI": ["/docs", "/redoc", "/openapi.json"], "Uvicorn": ["/docs", "/redoc"], "uvicorn": ["/docs", "/redoc"],
+    "Django": ["/admin/"], "Django runserver": ["/admin/"], "Rails": ["/rails/info/routes"], "Phoenix": ["/dev/dashboard"],
+    "Jupyter": ["/lab", "/tree"], "JupyterLab": ["/lab", "/tree"], "Jupyter Notebook": ["/tree"], "Grafana": ["/dashboards"],
+    "Ollama": ["/api/tags"], "Laravel": ["/telescope"], "Swagger UI": ["/openapi.json"], "Storybook": ["/?path=/docs"],
+    "Vite": ["/__inspect/"], "Streamlit": ["/healthz"], "Gradio": ["/docs"], "Hugo": ["/index.xml"], "MkDocs": ["/search/"],
+}
+
+
+def known_routes(e: Entry):
+    names = [e.app] + ([e.label.split("·")[0].strip()] if e.label else [])
+    out = []
+    for n in names:
+        for r in KNOWN_ROUTES.get(n, []):
+            if r not in out:
+                out.append(r)
+    return out
+
+
+STORE = os.path.join(HOME, "Library", "Application Support", "Wharfinger", "servers.json")
+
+
+def load_store():
+    try:
+        return {s["id"]: s for s in json.load(open(STORE))}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_store(store):
+    os.makedirs(os.path.dirname(STORE), exist_ok=True)
+    keep = sorted(store.values(), key=lambda s: s["lastSeen"], reverse=True)[:40]
+    tmp = STORE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(keep, f, indent=2, sort_keys=True)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, STORE)
+
+
+def store_id(cwd: str, argv) -> str:
+    return cwd + " | " + " ".join(argv)
+
+
+def remember(entries):
+    """Record running dev servers so `ports start` can bring them back later. Shares the file with the app."""
+    store = load_store()
+    changed = False
+    for e in entries:
+        if e.system or e.container or not e.argv or not e.cwd or e.cwd == "/":
+            continue
+        cwd = os.path.expanduser(e.cwd)
+        sid = store_id(cwd, e.argv)
+        store[sid] = {"id": sid, "port": e.port, "display": e.display, "cwd": cwd, "argv": e.argv, "env": e.env,
+                      "lastSeen": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+        changed = True
+    if changed:
+        save_store(store)
+
+
+def recently_stopped(entries):
+    running = {store_id(os.path.expanduser(e.cwd), e.argv) for e in entries if e.argv and e.cwd}
+    return [s for s in sorted(load_store().values(), key=lambda s: s["lastSeen"], reverse=True)
+            if s["id"] not in running and os.path.isdir(s["cwd"])]
+
+
+def cmd_recent():
+    stopped = recently_stopped(collect_all(True))
+    if not stopped:
+        print("no remembered servers that are stopped")
+        return
+    print(f"{'PORT':>5}  {'PROCESS':<18} {'LAST SEEN':<20} {'CWD'}")
+    for s in stopped[:15]:
+        print(f"{s['port']:>5}  {s['display'][:18]:<18} {s['lastSeen'][:16].replace('T', ' '):<20} {_tilde(s['cwd'])}")
+    print("start one with: ports start PORT")
+
+
+def cmd_start(port: int, here: bool):
+    if find_port(port) is not None:
+        print(f"something is already listening on :{port}", file=sys.stderr)
+        sys.exit(1)
+    match = [s for s in recently_stopped([]) if s["port"] == port]
+    if not match:
+        print(f"no remembered server on :{port} (see: ports recent)", file=sys.stderr)
+        sys.exit(1)
+    s = match[0]
+    script = write_restart_script(s["argv"], s["env"], s["cwd"], port)
+    if here:
+        os.execv("/bin/sh", ["/bin/sh", script])
+    subprocess.run(["open", "-b", "com.apple.terminal", script], check=False)
+    print(f"starting {s['display']} on :{port} in a new Terminal window")
 
 
 SKIP_ENV_PREFIXES = ("TERM", "SHLVL", "PWD", "OLDPWD", "_", "__CF", "XPC_", "TMPDIR", "SECURITYSESSIONID", "COMMAND_MODE", "LaunchInstanceID", "SSH_")
@@ -489,7 +618,7 @@ def cmd_list(include_system: bool):
     for e in entries:
         where = e.cwd or short_cmd(e.cmd, 60)
         pid = "-" if e.container else str(e.pid)
-        print(f"{e.port:>5}  {e.addr:<15} {pid:>6}  {e.display[:18]:<18} {e.label[:30]:<30} {e.env_tag[:30]:<30} {where}")
+        print(f"{e.port:>5}  {e.addr:<15} {pid:>6}  {e.display[:18]:<18} {e.label[:30]:<30} {e.env_tag[:30]:<30} {where}" + (f"  ⎇ {e.branch}" if e.branch else ""))
 
 
 def find_port(port: int):
@@ -512,7 +641,7 @@ def cmd_who(port: int):
     else:
         print(f"port {port} is used by {e.name} (pid {e.pid}) on {e.addr}:{e.port}")
         if e.cwd:
-            print(f"  cwd:     {e.cwd}")
+            print(f"  cwd:     {e.cwd}" + (f"  (branch {e.branch})" if e.branch else ""))
         if e.cmd:
             print(f"  command: {short_cmd(e.cmd, 200)}")
     if e.label:
@@ -522,6 +651,8 @@ def cmd_who(port: int):
     for d in e.env_details:
         print(f"           {d}")
     print(f"  url:     {e.url}")
+    for r in known_routes(e):
+        print(f"           {e.url}{r}")
     print(f"  free it: ports kill {port}")
 
 
@@ -605,6 +736,8 @@ def tui(stdscr):
     status = ""
     status_at = 0.0
     labels = {}  # entry.key -> (label, time)
+    healthy = set()  # keys that have answered HTTP at some point
+    hung = set()
     entries = collect_all(include_system)
 
     def probe_missing():
@@ -613,9 +746,19 @@ def tui(stdscr):
         if todo:
             probe_all(todo)
             for e in todo:
-                labels[e.key] = (e.label, now)
+                if e.label:
+                    healthy.add(e.key)
+                    hung.discard(e.key)
+                    labels[e.key] = (e.label, now)
+                elif e.key in healthy:
+                    hung.add(e.key)
+                    labels[e.key] = (labels.get(e.key, ("", 0))[0], now)
+                else:
+                    labels[e.key] = ("", now)
         for e in entries:
             e.label = labels.get(e.key, ("", 0))[0]
+            if e.key in hung:
+                e.label = "NOT RESPONDING · " + e.label
 
     probe_missing()
 
@@ -705,7 +848,7 @@ def tui(stdscr):
             attr = curses.A_REVERSE if selected else 0
             where = e.cwd
             cmd = short_cmd(e.cmd, rest_w)
-            tail = "  ·  ".join(p for p in (e.label, e.env_tag, where, cmd) if p)
+            tail = "  ·  ".join(p for p in (e.label, e.env_tag, (where + (f" ⎇ {e.branch}" if e.branch else "")) if where else "", cmd) if p)
             if len(tail) > rest_w:
                 tail = tail[: rest_w - 1] + "…"
             pid = "-" if e.container else str(e.pid)
@@ -806,6 +949,10 @@ def main(argv):
         cmd_edit(int(args[1]))
     elif sub in ("dir", "cd") and len(args) >= 2 and args[1].isdigit():
         print(project_dir(int(args[1])))
+    elif sub in ("recent", "stopped"):
+        cmd_recent()
+    elif sub in ("start", "up") and len(args) >= 2 and args[1].isdigit():
+        cmd_start(int(args[1]), "--here" in args)
     elif sub in ("restart", "rs") and len(args) >= 2 and args[1].isdigit():
         cmd_restart(int(args[1]), "--here" in args)
     elif sub in ("-h", "--help", "help"):

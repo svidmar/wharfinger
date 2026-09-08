@@ -27,8 +27,10 @@ struct Entry {
     let cwd: String
     let system: Bool
     var info: EnvInfo? = nil
+    var branch = ""                 // git branch of the project directory, if any
 
     var key: String { "\(pid):\(port)" }
+    var project: String { (cwd.isEmpty || cwd == "/") ? "" : cwd }
     /// What to call it in the list: the app we recognised (uvicorn, Vite, Jupyter …) or the process name.
     var display: String { info?.app ?? name }
     var url: String { "http://\(localAddrs.contains(addr) ? "localhost" : addr):\(port)" }
@@ -127,12 +129,19 @@ func collect() -> [Entry] {
         else if line.first == "n" { cwds[cur] = String(line.dropFirst()) }
     }
 
+    var branches: [String: String] = [:]
     return order.map { key -> Entry in
         let s = seen[key]!
         let cmd = cmds[s.pid] ?? ""
         var e = Entry(port: s.port, addr: s.addr, pid: s.pid, name: s.name, cmd: cmd,
                       cwd: tilde(cwds[s.pid] ?? ""), system: isSystem(cmd: cmd, name: s.name))
-        if !e.system { e.info = describeEnv(pid: e.pid, cwd: e.cwd) }
+        if !e.system {
+            e.info = describeEnv(pid: e.pid, cwd: e.cwd)
+            if !e.project.isEmpty {
+                if branches[e.cwd] == nil { branches[e.cwd] = gitBranch(e.cwd) }
+                e.branch = branches[e.cwd] ?? ""
+            }
+        }
         return e
     }.sorted { $0.port == $1.port ? $0.pid < $1.pid : $0.port < $1.port }
 }
@@ -144,6 +153,8 @@ struct EnvInfo {
     var runtime = ""                // "python 3.12.3", "node 20.11.0"
     var manager = ""                // ".venv", "pyenv", "nvm", "Homebrew", "system" …
     var exe = ""                    // resolved executable path
+    var argv: [String] = []         // exact command line, for restart / start again
+    var env: [String: String] = [:] // environment (minus terminal noise), for restart / start again
     var details: [String] = []      // extra lines for the submenu
     var tag: String { [runtime, manager].filter { !$0.isEmpty }.joined(separator: " · ") }
 }
@@ -195,6 +206,8 @@ func describeEnv(pid: Int32, cwd: String) -> EnvInfo? {
     envLock.lock(); if let c = envCache[pid] { envLock.unlock(); return c }; envLock.unlock()
     guard let (execPath, argv, env) = procArgsEnv(pid) else { return nil }
     var info = EnvInfo()
+    info.argv = argv
+    info.env = env.filter { k, _ in !skipEnvPrefixes.contains { k.hasPrefix($0) } }
     let absCwd = ((cwd.hasPrefix("~") ? home + cwd.dropFirst() : cwd) as NSString).resolvingSymlinksInPath
     var exe = execPath.hasPrefix("/") ? execPath : (absCwd + "/" + execPath)
     exe = (exe as NSString).standardizingPath   // keep symlinks: <venv>/bin/python must stay the venv path
@@ -278,6 +291,133 @@ func describeEnv(pid: Int32, cwd: String) -> EnvInfo? {
 
     envLock.lock(); envCache[pid] = info; envLock.unlock()
     return info
+}
+
+// MARK: - Git branch
+
+/// Branch checked out in `dir` (or its nearest parent repo); handles worktrees and detached HEADs.
+func gitBranch(_ dir: String) -> String {
+    var d = dir.hasPrefix("~") ? home + dir.dropFirst() : dir
+    let fm = FileManager.default
+    for _ in 0..<12 {
+        let dotGit = d + "/.git"
+        var gitDir = ""
+        var isDir: ObjCBool = false
+        if fm.fileExists(atPath: dotGit, isDirectory: &isDir) {
+            if isDir.boolValue { gitDir = dotGit }
+            else if let s = try? String(contentsOfFile: dotGit, encoding: .utf8), s.hasPrefix("gitdir:") {
+                let g = s.dropFirst(7).trimmingCharacters(in: .whitespacesAndNewlines)
+                gitDir = g.hasPrefix("/") ? g : d + "/" + g
+            }
+        }
+        if !gitDir.isEmpty {
+            guard let head = try? String(contentsOfFile: gitDir + "/HEAD", encoding: .utf8) else { return "" }
+            let h = head.trimmingCharacters(in: .whitespacesAndNewlines)
+            if h.hasPrefix("ref: refs/heads/") { return String(h.dropFirst(16)) }
+            if h.hasPrefix("ref: ") { return String(h.dropFirst(5)) }
+            return String(h.prefix(7))
+        }
+        let parent = (d as NSString).deletingLastPathComponent
+        if parent == d || parent.isEmpty || parent == home || parent == "/" { break }
+        d = parent
+    }
+    return ""
+}
+
+// MARK: - Known routes per framework
+
+let knownRoutes: [String: [String]] = [
+    "FastAPI": ["/docs", "/redoc", "/openapi.json"], "Uvicorn": ["/docs", "/redoc"], "uvicorn": ["/docs", "/redoc"],
+    "Django": ["/admin/"], "Django runserver": ["/admin/"], "Rails": ["/rails/info/routes"], "Phoenix": ["/dev/dashboard"],
+    "Jupyter": ["/lab", "/tree"], "JupyterLab": ["/lab", "/tree"], "Jupyter Notebook": ["/tree"], "Grafana": ["/dashboards"],
+    "Ollama": ["/api/tags"], "Laravel": ["/telescope"], "Swagger UI": ["/openapi.json"], "Storybook": ["/?path=/docs"],
+    "Vite": ["/__inspect/"], "Next.js": ["/_next/static/"], "Streamlit": ["/healthz"], "Gradio": ["/docs"],
+    "Hugo": ["/index.xml"], "MkDocs": ["/search/"], "Docusaurus": ["/docs"],
+]
+
+func routes(for e: Entry, probeLabel: String?) -> [String] {
+    var names: [String] = []
+    if let a = e.info?.app { names.append(a) }
+    if let l = probeLabel, let f = l.split(separator: "·").first { names.append(f.trimmingCharacters(in: .whitespaces)) }
+    var out: [String] = []
+    for n in names { for r in knownRoutes[n] ?? [] where !out.contains(r) { out.append(r) } }
+    return out
+}
+
+// MARK: - Remembered servers ("start again")
+
+struct RememberedServer: Codable {
+    var id: String            // cwd + command
+    var port: Int
+    var display: String
+    var cwd: String           // absolute
+    var argv: [String]
+    var env: [String: String]
+    var lastSeen: Date
+}
+
+final class ServerStore {
+    private(set) var servers: [String: RememberedServer] = [:]
+    let file: URL = {
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Wharfinger")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("servers.json")
+    }()
+
+    init() {
+        let dec = JSONDecoder(); dec.dateDecodingStrategy = .iso8601
+        if let d = try? Data(contentsOf: file), let list = try? dec.decode([RememberedServer].self, from: d) {
+            for s in list { servers[s.id] = s }
+        }
+    }
+
+    static func id(cwd: String, argv: [String]) -> String { cwd + " | " + argv.joined(separator: " ") }
+
+    /// Record every running dev server that we know how to start again.
+    func remember(_ entries: [Entry]) {
+        var changed = false
+        for e in entries {
+            guard let info = e.info, !info.argv.isEmpty, !e.project.isEmpty else { continue }
+            let cwd = e.cwd.hasPrefix("~") ? home + e.cwd.dropFirst() : e.cwd
+            let id = ServerStore.id(cwd: cwd, argv: info.argv)
+            servers[id] = RememberedServer(id: id, port: e.port, display: e.display, cwd: cwd, argv: info.argv, env: info.env, lastSeen: Date())
+            changed = true
+        }
+        if changed { save() }
+    }
+
+    func forget(_ id: String) { servers[id] = nil; save() }
+
+    /// Remembered servers that are not running right now, newest first, at most `limit`.
+    func stopped(running: [Entry], limit: Int = 8) -> [RememberedServer] {
+        var runningIds = Set<String>()
+        for e in running {
+            guard let info = e.info, !info.argv.isEmpty else { continue }
+            let cwd = e.cwd.hasPrefix("~") ? home + e.cwd.dropFirst() : e.cwd
+            runningIds.insert(ServerStore.id(cwd: cwd, argv: info.argv))
+        }
+        return servers.values.filter { !runningIds.contains($0.id) && FileManager.default.fileExists(atPath: $0.cwd) }
+            .sorted { $0.lastSeen > $1.lastSeen }.prefix(limit).map { $0 }
+    }
+
+    private func save() {
+        // Trim to the 40 most recent; the file can hold environment variables, so keep it private.
+        let keep = servers.values.sorted { $0.lastSeen > $1.lastSeen }.prefix(40)
+        servers = Dictionary(uniqueKeysWithValues: keep.map { ($0.id, $0) })
+        let enc = JSONEncoder(); enc.outputFormatting = [.prettyPrinted, .sortedKeys]; enc.dateEncodingStrategy = .iso8601   // shared with the CLI
+        if let d = try? enc.encode(Array(keep)) {
+            try? d.write(to: file, options: .atomic)
+            chmod(file.path, 0o600)
+        }
+    }
+}
+
+func ago(_ d: Date) -> String {
+    let s = Int(Date().timeIntervalSince(d))
+    if s < 60 { return "just now" }
+    if s < 3600 { return "\(s / 60) min ago" }
+    if s < 86400 { return "\(s / 3600) h ago" }
+    return "\(s / 86400) d ago"
 }
 
 // MARK: - Editors & terminals
@@ -398,7 +538,7 @@ func collectDocker() -> [Container] {
 // MARK: - HTTP probe: what answers on the port?
 
 final class Prober {
-    struct Result { let label: String; let at: Date }
+    struct Result { var label: String; var at: Date; var ok: Bool; var hadSuccess: Bool }
     private(set) var cache: [String: Result] = [:]
     private var inflight: Set<String> = []
     var onResult: ((String) -> Void)?
@@ -411,21 +551,35 @@ final class Prober {
     }()
 
     func label(_ key: String) -> String? { cache[key]?.label }
+    /// Answered HTTP before, but not any more: the process is alive, the server is not.
+    func hung(_ key: String) -> Bool { cache[key].map { $0.hadSuccess && !$0.ok } ?? false }
+    var onHung: ((String) -> Void)?
 
     func probe(key: String, url: String) {
-        if let r = cache[key], Date().timeIntervalSince(r.at) < (r.label.isEmpty ? 30 : 120) { return }
+        if let r = cache[key], Date().timeIntervalSince(r.at) < (r.hadSuccess ? 30 : 60) { return }
         guard !inflight.contains(key), let u = URL(string: url) else { return }
         inflight.insert(key)
         var req = URLRequest(url: u)
         req.httpMethod = "GET"
-        req.setValue("Ports/1.0", forHTTPHeaderField: "User-Agent")
+        req.setValue("Wharfinger/1.0", forHTTPHeaderField: "User-Agent")
+        // A server that answered before gets more patience before we call it hung.
+        if cache[key]?.hadSuccess == true { req.timeoutInterval = 5 }
         session.dataTask(with: req) { data, resp, _ in
+            let answered = resp != nil
             let label = Prober.describe(data: data, resp: resp as? HTTPURLResponse)
             dbg("probe \(key) \(url) -> status \(resp.map { String(($0 as? HTTPURLResponse)?.statusCode ?? 0) } ?? "nil") label '\(label)'")
             DispatchQueue.main.async {
                 self.inflight.remove(key)
-                self.cache[key] = Result(label: label, at: Date())
-                if !label.isEmpty { self.onResult?(key) }
+                let old = self.cache[key]
+                if answered {
+                    self.cache[key] = Result(label: label, at: Date(), ok: true, hadSuccess: true)
+                } else {
+                    // keep the last good label so the row still says what it was
+                    self.cache[key] = Result(label: old?.label ?? "", at: Date(), ok: false, hadSuccess: old?.hadSuccess ?? false)
+                }
+                let wasHung = old.map { $0.hadSuccess && !$0.ok } ?? false
+                if self.hung(key) && !wasHung { self.onHung?(key) }
+                if !label.isEmpty || old?.ok != self.cache[key]?.ok { self.onResult?(key) }
             }
         }.resume()
     }
@@ -513,6 +667,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
     var containers: [Container] = []
     var timer: Timer?
     let prober = Prober()
+    let store = ServerStore()
     var menuItems: [String: NSMenuItem] = [:]
     var known: [String: String]? = nil       // key -> description, baseline for notifications
     var notifyEnabled: Bool {
@@ -549,6 +704,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
         menu.delegate = self
         item.menu = menu
         prober.onResult = { [weak self] key in self?.updateRow(key) }
+        prober.onHung = { [weak self] key in
+            guard let self = self, self.notifyEnabled, let e = self.entries.first(where: { $0.key == key }) else { return }
+            self.notify(title: "Dev server not responding", body: ":\(e.port) \(e.display)" + (e.project.isEmpty ? "" : "  ·  \(e.cwd)"), url: e.url)
+        }
 
         let center = UNUserNotificationCenter.current()
         center.delegate = self
@@ -569,11 +728,13 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
     func apply(entries e: [Entry], containers c: [Container]) {
         entries = e
         containers = c
-        dbg("refresh: \(e.count) listeners, \(c.count) containers, dev: " + devEntries().map { ":\($0.port) \($0.display) [\($0.info?.tag ?? "")]" }.joined(separator: ", "))
+        dbg("refresh: \(e.count) listeners, \(c.count) containers, dev: " + devEntries().map { ":\($0.port) \($0.display) [\($0.info?.tag ?? "")] \($0.branch.isEmpty ? "" : "⎇" + $0.branch) \(self.prober.hung($0.key) ? "HUNG" : "")" }.joined(separator: ", "))
         let dev = devEntries()
+        dbg("stopped: " + store.stopped(running: dev).map { ":\($0.port) \($0.display) \(tilde($0.cwd))" }.joined(separator: ", "))
         let n = dev.count + containers.count
         item.button?.title = n > 0 ? " \(n)" : ""
         for e in dev { prober.probe(key: e.key, url: e.url) }
+        store.remember(dev)
         for c in containers { for p in c.ports where p.proto == "tcp" { prober.probe(key: "\(c.key):\(p.host)", url: c.url(p.host)) } }
         diffAndNotify(dev: dev, containers: containers)
     }
@@ -661,6 +822,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
         menu.removeAllItems()
         menuItems.removeAll()
         rowGroups.removeAll()
+        rowInProject.removeAll()
         let dev = devEntries()
         let devKeys = Set(dev.map { $0.key })
         let other = entries.filter { !devKeys.contains($0.key) }
@@ -670,16 +832,35 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
         } else {
             menu.addItem(header("Dev servers"))
             // A process with many ports (a Jupyter kernel has five) becomes one row.
-            var groups: [[Entry]] = []
+            var byPid: [[Entry]] = []
             for e in dev {
-                if let i = groups.firstIndex(where: { $0[0].pid == e.pid }), groups[i].count + 1 >= 3 || groups[i].count >= 3 { groups[i].append(e) }
-                else { groups.append([e]) }
+                if let i = byPid.firstIndex(where: { $0[0].pid == e.pid }) { byPid[i].append(e) } else { byPid.append([e]) }
             }
-            var merged: [[Entry]] = []
-            for g in groups {
-                if g.count >= 3 { merged.append(g) } else { g.forEach { merged.append([$0]) } }
+            var rows: [[Entry]] = []
+            for g in byPid { if g.count >= 3 { rows.append(g) } else { g.forEach { rows.append([$0]) } } }
+            // Projects with more than one server get a project row with the servers indented under it.
+            var projects: [String: [[Entry]]] = [:]
+            var order: [String] = []
+            for r in rows {
+                let p = r[0].project
+                if projects[p] == nil { order.append(p) }
+                projects[p, default: []].append(r)
             }
-            merged.forEach { menu.addItem(entryItem($0)) }
+            for p in order {
+                let group = projects[p]!
+                if !p.isEmpty && group.count > 1 {
+                    menu.addItem(projectItem(group[0][0]))
+                    for r in group { let it = entryItem(r, inProject: true); it.indentationLevel = 1; menu.addItem(it) }
+                } else {
+                    group.forEach { menu.addItem(entryItem($0)) }
+                }
+            }
+        }
+        let stopped = store.stopped(running: dev)
+        if !stopped.isEmpty {
+            menu.addItem(.separator())
+            menu.addItem(header("Recently stopped"))
+            stopped.forEach { menu.addItem(stoppedItem($0)) }
         }
         if !containers.isEmpty {
             menu.addItem(.separator())
@@ -785,7 +966,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
         return t
     }
 
-    func entryTitle(_ group: [Entry]) -> NSAttributedString {
+    func entryTitle(_ group: [Entry], inProject: Bool = false) -> NSAttributedString {
         let e = group[0]
         if e.system {
             let ports = group.map { ":\($0.port)" }.joined(separator: " ")
@@ -794,15 +975,60 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
         let port = group.count > 1 ? ":\(e.port) +\(group.count - 1)" : ":\(e.port)"
         let probe = group.compactMap { prober.label($0.key) }.first { !$0.isEmpty }
         var detail = e.info?.tag ?? ""
-        if e.cwd != "/" && !e.cwd.isEmpty { detail += (detail.isEmpty ? "" : "   ") + e.cwd }
-        return rowTitle(port: port, name: e.display, probe: probe, detail: detail)
+        if !inProject && !e.project.isEmpty {
+            detail += (detail.isEmpty ? "" : "   ") + e.cwd + (e.branch.isEmpty ? "" : "  ⎇ \(e.branch)")
+        }
+        let hung = group.contains { prober.hung($0.key) }
+        let t = NSMutableAttributedString(attributedString: rowTitle(port: port, name: e.display, probe: probe, detail: detail))
+        if hung {
+            t.append(NSAttributedString(string: "   ⚠︎ not responding", attributes: [.font: small, .foregroundColor: NSColor.systemRed]))
+        }
+        return t
+    }
+
+    func projectItem(_ e: Entry) -> NSMenuItem {
+        let it = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        let t = NSMutableAttributedString(string: e.cwd, attributes: [.font: NSFont.menuFont(ofSize: 0)])
+        if !e.branch.isEmpty {
+            t.append(NSAttributedString(string: "   ⎇ \(e.branch)", attributes: [.font: small, .foregroundColor: NSColor.secondaryLabelColor]))
+        }
+        it.attributedTitle = t
+        it.image = NSImage(systemSymbolName: "folder", accessibilityDescription: nil)
+        let box = Box(e)
+        it.representedObject = box
+        let sub = NSMenu()
+        if !editor.isEmpty { sub.addItem(action("Open project in \(editor)", #selector(openInEditor(_:)), box)) }
+        sub.addItem(action("Open project in \(terminal)", #selector(openInTerm(_:)), box))
+        sub.addItem(action("Reveal project in Finder", #selector(revealInFinder(_:)), box))
+        it.submenu = sub
+        return it
+    }
+
+    func stoppedItem(_ r: RememberedServer) -> NSMenuItem {
+        let it = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        let t = NSMutableAttributedString(string: ":\(r.port)".padding(toLength: 7, withPad: " ", startingAt: 0), attributes: [.font: mono, .foregroundColor: NSColor.secondaryLabelColor])
+        t.append(NSAttributedString(string: r.display, attributes: [.font: NSFont.menuFont(ofSize: 0), .foregroundColor: NSColor.secondaryLabelColor]))
+        t.append(NSAttributedString(string: "   \(tilde(r.cwd))   \(ago(r.lastSeen))", attributes: [.font: small, .foregroundColor: NSColor.tertiaryLabelColor]))
+        it.attributedTitle = t
+        let sub = NSMenu()
+        let start = NSMenuItem(title: "Start again (in a new Terminal window)", action: #selector(startAgain(_:)), keyEquivalent: "")
+        start.target = self; start.representedObject = r.id
+        sub.addItem(start)
+        let forget = NSMenuItem(title: "Forget", action: #selector(forgetServer(_:)), keyEquivalent: "")
+        forget.target = self; forget.representedObject = r.id
+        sub.addItem(forget)
+        sub.addItem(.separator())
+        sub.addItem(header(String(r.argv.joined(separator: " ").prefix(100))))
+        sub.addItem(header("in \(tilde(r.cwd))"))
+        it.submenu = sub
+        return it
     }
 
     func updateRow(_ key: String) {
         guard let it = menuItems[key] else { return }
         if let box = it.representedObject as? Box {
-            if box.entry != nil, let group = it.representedObject.flatMap({ _ in rowGroups[key] }) {
-                it.attributedTitle = entryTitle(group)
+            if box.entry != nil, let group = rowGroups[key] {
+                it.attributedTitle = entryTitle(group, inProject: rowInProject.contains(key))
             } else if let c = box.container {
                 it.attributedTitle = containerTitle(c)
             }
@@ -811,18 +1037,32 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
 
     var rowGroups: [String: [Entry]] = [:]
 
-    func entryItem(_ group: [Entry]) -> NSMenuItem {
+    var rowInProject: Set<String> = []
+
+    func entryItem(_ group: [Entry], inProject: Bool = false) -> NSMenuItem {
         let e = group[0]
         let it = NSMenuItem(title: "", action: nil, keyEquivalent: "")
-        it.attributedTitle = entryTitle(group)
+        it.attributedTitle = entryTitle(group, inProject: inProject)
+        if inProject { for g in group { rowInProject.insert(g.key) } }
         let box = Box(e)
         it.representedObject = box
         for g in group { menuItems[g.key] = it; rowGroups[g.key] = group }
 
         let sub = NSMenu()
+        if group.contains(where: { prober.hung($0.key) }) {
+            sub.addItem(header("⚠︎ Answered HTTP before, but not any more"))
+            sub.addItem(action("Restart (in a new Terminal window)", #selector(restart(_:)), box))
+            sub.addItem(.separator())
+        }
         for g in group {
             let b = Box(g)
             sub.addItem(action("Open \(g.url)", #selector(openURL(_:)), b))
+        }
+        for r in routes(for: e, probeLabel: prober.label(e.key)) {
+            let m = action("Open \(r)", #selector(openRoute(_:)), box)
+            m.representedObject = [box, r] as [Any]
+            m.indentationLevel = 1
+            sub.addItem(m)
         }
         sub.addItem(action(group.count > 1 ? "Copy URL (:\(e.port))" : "Copy URL", #selector(copyURL(_:)), box))
         sub.addItem(.separator())
@@ -938,6 +1178,23 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
         guard let e = (box(sender) ?? ((sender as? NSMenuItem)?.representedObject as? [Any])?.first as? Box)?.entry,
               !e.cwd.isEmpty, e.cwd != "/" else { return nil }
         return e.cwd.hasPrefix("~") ? home + e.cwd.dropFirst() : e.cwd
+    }
+
+    @objc func openRoute(_ sender: Any?) {
+        guard let pair = (sender as? NSMenuItem)?.representedObject as? [Any], let b = pair.first as? Box, let e = b.entry,
+              let r = pair.last as? String, let u = URL(string: e.url + r) else { return }
+        NSWorkspace.shared.open(u)
+    }
+
+    @objc func startAgain(_ sender: Any?) {
+        guard let id = (sender as? NSMenuItem)?.representedObject as? String, let r = store.servers[id] else { return }
+        guard let script = writeRestartScript(argv: r.argv, env: r.env, cwd: r.cwd, port: r.port) else { return }
+        _ = run("/usr/bin/open", ["-b", "com.apple.terminal", script.path])
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self.refreshAsync() }
+    }
+
+    @objc func forgetServer(_ sender: Any?) {
+        if let id = (sender as? NSMenuItem)?.representedObject as? String { store.forget(id) }
     }
 
     @objc func openInEditor(_ sender: Any?) {

@@ -10,14 +10,36 @@ For macOS. A menu bar app plus a terminal command, no dependencies beyond what s
 :5432     docker:pg       postgres:16
 ```
 
+## Install
+
+Wharfinger is built from source on your own Mac. It takes about twenty seconds and needs nothing but
+the Xcode Command Line Tools (`xcode-select --install` if you don't have them).
+
+```
+git clone https://github.com/svidmar/wharfinger.git
+cd wharfinger
+./build.sh --install     # menu bar app  → ~/Applications/Wharfinger.app, launched
+./install.sh             # terminal command → ~/.local/bin/ports
+```
+
+Building locally is what makes the app run without a Gatekeeper warning: macOS trusts apps you compiled
+yourself, but a prebuilt download would have to be notarised by Apple. There is no prebuilt download for that reason.
+To update, `git pull` and run `./build.sh --install` again. To uninstall, quit it from the menu and delete
+`~/Applications/Wharfinger.app` and `~/Library/Application Support/Wharfinger`.
+
 ## Menu bar app
 
-```
-./build.sh --install   # builds Wharfinger.app with swiftc, copies it to ~/Applications and launches it
-```
-
 - The icon shows how many dev servers and containers are listening. Click it for the list.
-- Each row: port, program, what answers on it (framework · page title), runtime and environment, project directory.
+- Each row: port, program, what answers on it (framework · page title), runtime and environment, project directory
+  and its git branch (worktrees included).
+- Servers in the same directory (a frontend and its API, say) are grouped under a project row with the branch.
+- **Start again**: servers Wharfinger has seen are remembered with their exact command, directory and environment,
+  so a "Recently stopped" section lets you start them again later, even after a reboot. Remembered servers live in
+  `~/Library/Application Support/Wharfinger/servers.json` (readable only by you, since it can hold environment variables).
+- **Not responding**: a server that used to answer HTTP but no longer does is flagged in red with a Restart
+  shortcut, and you get a notification. Processes that never spoke HTTP (Jupyter kernel ports, databases) are left alone.
+- **Known routes**: FastAPI/Uvicorn get "Open /docs" and "/redoc", Django "/admin/", Jupyter "/lab", Rails
+  "/rails/info/routes", Phoenix "/dev/dashboard", Ollama "/api/tags" and so on, right under Open.
 - **Environment per server**: which python/node/ruby… and version, and where it comes from: a `.venv`
   (plain, uv or poetry), conda env, pyenv, nvm, fnm, volta, asdf, mise, Homebrew, python.org, system.
   Read from the process' real executable path and environment, so it works even when the venv was never
@@ -60,9 +82,12 @@ ports restart 3000        # stop and re-run the same command in a new Terminal w
 ports restart 3000 --here # same, but run it in this terminal
 ports edit 3000           # open the project in your editor (PORTS_EDITOR app name, else first installed, else $EDITOR)
 ports dir 3000            # print the project directory:  cd "$(ports dir 3000)"
+ports recent              # remembered servers that are not running now
+ports start 3000          # start a remembered server again (same command, cwd and env)
 ```
 
-`ports who` also prints the environment: runtime and version, venv / conda / version manager, base interpreter, executable.
+`ports who` also prints the environment (runtime and version, venv / conda / version manager, base interpreter,
+executable), the git branch and the known routes. The interactive list marks servers that stopped answering HTTP.
 
 Keys in the interactive list:
 
@@ -87,8 +112,9 @@ Green process names are dev servers, yellow are apps/system, cyan are Docker con
 - Each dev server gets one HTTP GET. The response is matched against ~30 framework fingerprints
   (Vite, Next.js, Nuxt, SvelteKit, Django, FastAPI, Uvicorn, Flask, Express, Jupyter, Ollama …) and the `<title>` is read.
 - Docker rows come from `docker ps`, when the daemon is running.
-- Restart reads the exact argv and environment of the process via `sysctl KERN_PROCARGS2`,
-  writes them to a `.command` script under `~/Library/Application Support/Wharfinger/` and opens it in Terminal.
+- Restart and Start again read the exact argv and environment of the process via `sysctl KERN_PROCARGS2`,
+  write them to a `.command` script under `~/Library/Application Support/Wharfinger/` and open it in Terminal.
+- The git branch comes from reading `.git/HEAD` (following `gitdir:` files for worktrees), no git invocation.
 - Only your own processes can be inspected or killed without sudo.
 
 ## License
