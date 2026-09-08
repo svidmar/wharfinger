@@ -45,5 +45,6 @@ The same thing as a native menu bar app, built with plain `swiftc` (no Xcode pro
 - Apps and system processes (Spotify, Dropbox, ControlCenter …) live in a collapsed "Apps & system" submenu.
 - "Start at login" registers it as a login item. "Quit Ports" removes it from the menu bar.
 - The list is rebuilt every time the menu opens, and the count refreshes every 15 s.
+- ⌃⌥P pops the menu up at the mouse, handy on a notch MacBook when the menu bar is too full to show the icon.
 
 Source is in `Ports/main.swift`. Re-run `./build.sh --install` after changes.

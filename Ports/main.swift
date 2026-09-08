@@ -2,6 +2,7 @@
 // Build with ./build.sh (plain swiftc, no Xcode project needed).
 
 import AppKit
+import Carbon.HIToolbox
 import ServiceManagement
 
 let home = NSHomeDirectory()
@@ -119,6 +120,24 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         item.menu = menu
         refresh()
         timer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in self?.refresh() }
+        registerHotKey()
+    }
+
+    // ⌃⌥P pops the menu at the mouse, useful when the menu bar is too full to show the icon.
+    var hotKeyRef: EventHotKeyRef?
+    func registerHotKey() {
+        var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+        InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
+            DispatchQueue.main.async { delegate.showMenuAtMouse() }
+            return noErr
+        }, 1, &spec, nil, nil)
+        let id = EventHotKeyID(signature: 0x50525453, id: 1)
+        RegisterEventHotKey(UInt32(kVK_ANSI_P), UInt32(controlKey | optionKey), id, GetApplicationEventTarget(), 0, &hotKeyRef)
+    }
+
+    func showMenuAtMouse() {
+        NSApp.activate(ignoringOtherApps: true)
+        menu.popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil)
     }
 
     func refresh() {
@@ -153,6 +172,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         login.target = self
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
         menu.addItem(login)
+        menu.addItem(header("⌃⌥P opens this menu anywhere"))
         menu.addItem(withTitle: "Quit Ports", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
     }
 
