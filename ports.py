@@ -4,21 +4,32 @@
 Usage:
   ports                 interactive list (arrow keys, Enter/o = open, k = kill)
   ports list [-d]       plain table (-d hides system/app processes)
+  ports who PORT        who is using PORT? (exit 1 if free)
   ports open PORT       open http://localhost:PORT in the browser
-  ports kill PORT [-9]  kill the process listening on PORT
+  ports kill PORT [-9]  kill the process (or stop the container) listening on PORT
 
+Docker containers with published ports are listed too, when the daemon runs.
+Each dev server is probed with one HTTP GET to show the framework / page title.
 No dependencies beyond macOS's lsof/ps and Python 3.
 """
 
 import curses
+import html
+import json
 import os
+import re
+import shutil
 import signal
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 
 HOME = os.path.expanduser("~")
+DOCKER = next((p for p in ["/usr/local/bin/docker", "/opt/homebrew/bin/docker", HOME + "/.docker/bin/docker",
+                           "/Applications/Docker.app/Contents/Resources/bin/docker"] if os.access(p, os.X_OK)), shutil.which("docker"))
 
 # Executable locations that are almost certainly not your dev servers.
 SYSTEM_PREFIXES = (
@@ -41,6 +52,12 @@ class Entry:
     cmd: str
     cwd: str
     system: bool
+    container: str = ""   # docker container id, when this row is a container
+    label: str = ""       # what answered the HTTP probe
+
+    @property
+    def key(self) -> str:
+        return f"{self.container or self.pid}:{self.port}"
 
     @property
     def url(self) -> str:
@@ -125,6 +142,106 @@ def collect(include_system: bool = True):
     return entries
 
 
+def collect_docker():
+    """One Entry per published host port of each running container."""
+    if not DOCKER:
+        return []
+    out = _run([DOCKER, "ps", "--format", "{{json .}}"])
+    entries = []
+    for line in out.splitlines():
+        try:
+            c = json.loads(line)
+        except ValueError:
+            continue
+        seen = set()
+        for host, cport, proto in re.findall(r"(?:[\d.]+|\[?::\]?):(\d+)->(\d+)/(\w+)", c.get("Ports", "")):
+            if host in seen:
+                continue
+            seen.add(host)
+            entries.append(Entry(int(host), "0.0.0.0", 0, "docker:" + c.get("Names", "?"),
+                                 f"{c.get('Image', '')}  ({c.get('Status', '')})", "", False, c.get("ID", "")))
+    return entries
+
+
+def collect_all(include_system: bool = True):
+    docker = collect_docker()
+    docker_ports = {e.port for e in docker}
+    procs = [e for e in collect(include_system)
+             if not (e.port in docker_ports and "docker" in e.name.lower())]
+    return sorted(procs + docker, key=lambda e: (e.port, e.pid))
+
+
+FRAMEWORK_HINTS = [
+    ("Vite", lambda b, sv, pw: "/@vite/client" in b or "@vite/client" in b),
+    ("Next.js", lambda b, sv, pw: "/_next/" in b or "next.js" in pw),
+    ("Nuxt", lambda b, sv, pw: "__nuxt" in b),
+    ("SvelteKit", lambda b, sv, pw: "__sveltekit" in b),
+    ("Remix", lambda b, sv, pw: "__remixcontext" in b),
+    ("Astro", lambda b, sv, pw: "astro-island" in b or "/_astro/" in b),
+    ("Angular", lambda b, sv, pw: "ng-version" in b),
+    ("Storybook", lambda b, sv, pw: "storybook" in b),
+    ("Streamlit", lambda b, sv, pw: "streamlit" in b),
+    ("Gradio", lambda b, sv, pw: "gradio" in b),
+    ("Jupyter", lambda b, sv, pw: "jupyter" in b),
+    ("Ollama", lambda b, sv, pw: "ollama is running" in b),
+    ("Grafana", lambda b, sv, pw: "grafana" in b),
+    ("Swagger UI", lambda b, sv, pw: "swagger-ui" in b),
+    ("Django", lambda b, sv, pw: "django" in b or "wsgiserver" in sv),
+    ("FastAPI", lambda b, sv, pw: "fastapi" in b),
+    ("Uvicorn", lambda b, sv, pw: "uvicorn" in sv),
+    ("Flask", lambda b, sv, pw: "werkzeug" in sv),
+    ("Express", lambda b, sv, pw: "express" in pw),
+    ("PHP", lambda b, sv, pw: "php" in pw),
+    ("Rails", lambda b, sv, pw: "csrf-param" in b and "rails" in b),
+    ("Phoenix", lambda b, sv, pw: "phoenix" in b and "csrf" in b),
+    ("MkDocs", lambda b, sv, pw: "mkdocs" in b),
+    ("Docusaurus", lambda b, sv, pw: "docusaurus" in b),
+    ("Hugo", lambda b, sv, pw: 'generator" content="hugo' in b),
+    ("Jekyll", lambda b, sv, pw: 'generator" content="jekyll' in b),
+    ("Python http.server", lambda b, sv, pw: "simplehttp" in sv),
+    ("Webpack dev server", lambda b, sv, pw: "webpack" in b),
+]
+
+
+def probe(url: str, timeout: float = 1.5) -> str:
+    """One GET; returns 'Framework · Page title' or '' when nothing HTTP answers."""
+    req = urllib.request.Request(url, headers={"User-Agent": "ports/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            status, headers, body = r.status, r.headers, r.read(200_000).decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        status, headers, body = e.code, e.headers, e.read(200_000).decode("utf-8", "replace")
+    except Exception:
+        return ""
+    lower = body.lower()
+    sv = (headers.get("Server") or "").lower()
+    pw = (headers.get("X-Powered-By") or "").lower()
+    framework = next((name for name, test in FRAMEWORK_HINTS if test(lower, sv, pw)), "")
+    if not framework and sv:
+        framework = sv.split("/")[0].capitalize()
+    m = re.search(r"<title[^>]*>\s*(.*?)\s*</title>", body, re.I | re.S)
+    title = html.unescape(re.sub(r"\s+", " ", m.group(1))).strip() if m else ""
+    if len(title) > 45:
+        title = title[:44] + "…"
+    if not title and not framework and "json" in (headers.get("Content-Type") or ""):
+        framework = "JSON API"
+    parts = [p for p in (framework, title) if p]
+    if not parts:
+        return f"HTTP {status}"
+    if status >= 400:
+        parts.append(f"({status})")
+    return " · ".join(parts)
+
+
+def probe_all(entries, only_dev: bool = True):
+    targets = [e for e in entries if not e.system or not only_dev]
+    if not targets:
+        return
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        for e, label in zip(targets, ex.map(lambda e: probe(e.url), targets)):
+            e.label = label
+
+
 def open_url(entry: Entry):
     subprocess.Popen(["open", entry.url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -134,6 +251,10 @@ def copy_url(entry: Entry):
 
 
 def kill(entry: Entry, force: bool = False) -> str:
+    if entry.container:
+        verb = "kill" if force else "stop"
+        _run([DOCKER, verb, entry.container])
+        return f"docker {verb} {entry.name[7:]} (:{entry.port})"
     sig = signal.SIGKILL if force else signal.SIGTERM
     try:
         os.kill(entry.pid, sig)
@@ -162,21 +283,45 @@ def short_cmd(cmd: str, width: int) -> str:
 
 
 def cmd_list(include_system: bool):
-    entries = collect(include_system)
+    entries = collect_all(include_system)
     if not entries:
         print("nothing listening" + ("" if include_system else " (drop -d to include system/app processes)"))
         return
-    print(f"{'PORT':>5}  {'ADDR':<15} {'PID':>6}  {'PROCESS':<20} {'CWD / COMMAND'}")
+    probe_all(entries)
+    print(f"{'PORT':>5}  {'ADDR':<15} {'PID':>6}  {'PROCESS':<20} {'ANSWERS':<32} {'CWD / COMMAND'}")
     for e in entries:
         where = e.cwd or short_cmd(e.cmd, 60)
-        print(f"{e.port:>5}  {e.addr:<15} {e.pid:>6}  {e.name[:20]:<20} {where}")
+        pid = "-" if e.container else str(e.pid)
+        print(f"{e.port:>5}  {e.addr:<15} {pid:>6}  {e.name[:20]:<20} {e.label[:32]:<32} {where}")
 
 
 def find_port(port: int):
-    for e in collect(True):
+    for e in collect_all(True):
         if e.port == port:
             return e
     return None
+
+
+def cmd_who(port: int):
+    e = find_port(port)
+    if e is None:
+        print(f"port {port} is free")
+        sys.exit(1)
+    e.label = probe(e.url)
+    if e.container:
+        print(f"port {port} is published by docker container {e.name[7:]}")
+        print(f"  image:   {e.cmd}")
+        print(f"  id:      {e.container}")
+    else:
+        print(f"port {port} is used by {e.name} (pid {e.pid}) on {e.addr}:{e.port}")
+        if e.cwd:
+            print(f"  cwd:     {e.cwd}")
+        if e.cmd:
+            print(f"  command: {short_cmd(e.cmd, 200)}")
+    if e.label:
+        print(f"  answers: {e.label}")
+    print(f"  url:     {e.url}")
+    print(f"  free it: ports kill {port}")
 
 
 def cmd_open(port: int):
@@ -218,7 +363,20 @@ def tui(stdscr):
     top = 0
     status = ""
     status_at = 0.0
-    entries = collect(include_system)
+    labels = {}  # entry.key -> (label, time)
+    entries = collect_all(include_system)
+
+    def probe_missing():
+        now = time.time()
+        todo = [e for e in entries if not e.system and (e.key not in labels or now - labels[e.key][1] > (120 if labels[e.key][0] else 30))]
+        if todo:
+            probe_all(todo)
+            for e in todo:
+                labels[e.key] = (e.label, now)
+        for e in entries:
+            e.label = labels.get(e.key, ("", 0))[0]
+
+    probe_missing()
 
     def visible():
         if not query:
@@ -228,7 +386,8 @@ def tui(stdscr):
 
     def refresh_data():
         nonlocal entries
-        entries = collect(include_system)
+        entries = collect_all(include_system)
+        probe_missing()
 
     def set_status(msg):
         nonlocal status, status_at
@@ -292,7 +451,7 @@ def tui(stdscr):
         name_w = 18
         addr_w = 15
         rest_w = max(10, w - (6 + 2 + addr_w + 1 + 7 + 2 + name_w + 1) - 1)
-        header = f"{'PORT':>6}  {'ADDR':<{addr_w}} {'PID':>7}  {'PROCESS':<{name_w}} {'CWD  ·  COMMAND'}"
+        header = f"{'PORT':>6}  {'ADDR':<{addr_w}} {'PID':>7}  {'PROCESS':<{name_w}} {'ANSWERS  ·  CWD  ·  COMMAND'}"
         stdscr.addnstr(1, 0, header, w - 1, curses.A_BOLD)
 
         if not rows:
@@ -305,22 +464,20 @@ def tui(stdscr):
             attr = curses.A_REVERSE if selected else 0
             where = e.cwd
             cmd = short_cmd(e.cmd, rest_w)
-            if where and cmd:
-                tail = f"{where}  ·  {cmd}"
-            else:
-                tail = where or cmd
+            tail = "  ·  ".join(p for p in (e.label, where, cmd) if p)
             if len(tail) > rest_w:
                 tail = tail[: rest_w - 1] + "…"
-            line = f"{e.port:>6}  {e.addr:<{addr_w}} {e.pid:>7}  {e.name[:name_w]:<{name_w}} {tail}"
+            pid = "-" if e.container else str(e.pid)
+            line = f"{e.port:>6}  {e.addr:<{addr_w}} {pid:>7}  {e.name[:name_w]:<{name_w}} {tail}"
             if selected:
                 stdscr.addnstr(y, 0, line.ljust(w), w - 1, attr)
             else:
                 stdscr.addnstr(y, 0, f"{e.port:>6}", w - 1, curses.color_pair(1) | curses.A_BOLD)
                 stdscr.addnstr(y, 8, f"{e.addr:<{addr_w}}", w - 9, curses.A_DIM)
-                stdscr.addnstr(y, 8 + addr_w + 1, f"{e.pid:>7}", w - 9 - addr_w - 1, curses.A_DIM)
+                stdscr.addnstr(y, 8 + addr_w + 1, f"{pid:>7}", w - 9 - addr_w - 1, curses.A_DIM)
                 x = 8 + addr_w + 1 + 7 + 2
                 if x < w - 1:
-                    stdscr.addnstr(y, x, f"{e.name[:name_w]:<{name_w}}", w - x - 1, curses.color_pair(2) if e.system else curses.color_pair(3))
+                    stdscr.addnstr(y, x, f"{e.name[:name_w]:<{name_w}}", w - x - 1, curses.color_pair(1) if e.container else curses.color_pair(2) if e.system else curses.color_pair(3))
                 x += name_w + 1
                 if x < w - 1:
                     stdscr.addnstr(y, x, tail, w - x - 1)
@@ -355,12 +512,12 @@ def tui(stdscr):
             set_status(f"copied {rows[sel].url}")
         elif ch == ord("k") and rows:
             e = rows[sel]
-            if ask(f"Kill {e.name} (pid {e.pid}) on :{e.port}?"):
+            if ask(f"{'Stop container' if e.container else 'Kill'} {e.name} on :{e.port}?"):
                 set_status(kill(e, False))
                 refresh_data()
         elif ch == ord("K") and rows:
             e = rows[sel]
-            if ask(f"Force kill (-9) {e.name} (pid {e.pid}) on :{e.port}?"):
+            if ask(f"Force {'stop' if e.container else 'kill (-9)'} {e.name} on :{e.port}?"):
                 set_status(kill(e, True))
                 refresh_data()
         elif ch == ord("a"):
@@ -386,6 +543,8 @@ def main(argv):
     sub = args[0]
     if sub in ("list", "ls", "l"):
         cmd_list(not ("-d" in args or "--dev" in args))
+    elif sub in ("who", "w") and len(args) >= 2 and args[1].isdigit():
+        cmd_who(int(args[1]))
     elif sub in ("open", "o") and len(args) >= 2 and args[1].isdigit():
         cmd_open(int(args[1]))
     elif sub in ("kill", "k") and len(args) >= 2 and args[1].isdigit():
