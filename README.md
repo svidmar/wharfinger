@@ -1,7 +1,13 @@
+<img src="docs/icon.png" width="96" align="left" alt="">
+
 # Wharfinger
 
 See what is listening on localhost, what answers there, and open, kill or restart it.
 For macOS. A menu bar app plus a terminal command, no dependencies beyond what ships with macOS.
+
+<br clear="left">
+
+![The Wharfinger menu](docs/menu.png)
 
 ```
 :5173     Vite            Vite · My App          node 22.20.0 · nvm             ~/code/my-app

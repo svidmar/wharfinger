@@ -13,12 +13,19 @@ if ! command -v swiftc >/dev/null 2>&1 || ! xcode-select -p >/dev/null 2>&1; the
     exit 1
 fi
 
+if [ "$1" = "--icon" ]; then
+    mkdir -p build
+    swiftc -O -o build/make-icon Wharfinger/make-icon.swift && build/make-icon Wharfinger/AppIcon.icns
+    exit $?
+fi
+
 app="build/Wharfinger.app"
 rm -rf build
-mkdir -p "$app/Contents/MacOS"
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 echo "compiling Wharfinger/main.swift …"
 swiftc -O -o "$app/Contents/MacOS/Wharfinger" Wharfinger/main.swift
 cp Wharfinger/Info.plist "$app/Contents/"
+cp Wharfinger/AppIcon.icns "$app/Contents/Resources/"
 # Ad-hoc signature: enough to run on the machine that built it. A downloaded copy would need notarisation.
 codesign --force --sign - "$app" 2>/dev/null
 echo "built $app"

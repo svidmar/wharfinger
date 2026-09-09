@@ -775,7 +775,11 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
     func notify(title: String, body: String, url: String?) {
         let content = UNMutableNotificationContent()
         content.title = title
-        content.body = body
+        // "  ·  " splits "port program" from the project directory: the directory becomes the subtitle.
+        let parts = body.components(separatedBy: "  ·  ")
+        content.body = parts[0]
+        if parts.count > 1 { content.subtitle = parts[1...].joined(separator: " · ") }
+        content.threadIdentifier = url ?? body
         if let url = url { content.userInfo = ["url": url] }
         let req = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
         dbg("notify: \(title) – \(body)")
