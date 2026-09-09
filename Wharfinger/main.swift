@@ -551,7 +551,6 @@ final class Prober {
     }()
 
     func label(_ key: String) -> String? { cache[key]?.label }
-    func seed(_ key: String, _ label: String, ok: Bool = true) { cache[key] = Result(label: label, at: .distantFuture, ok: ok, hadSuccess: true) }
     /// Answered HTTP before, but not any more: the process is alive, the server is not.
     func hung(_ key: String) -> Bool { cache[key].map { $0.hadSuccess && !$0.ok } ?? false }
     var onHung: ((String) -> Void)?
@@ -648,40 +647,6 @@ final class Prober {
     }
 }
 
-// MARK: - Demo mode (WHARFINGER_DEMO=1): made-up servers for screenshots, nothing real is shown
-
-let demo = ProcessInfo.processInfo.environment["WHARFINGER_DEMO"] != nil
-
-func demoEntry(_ port: Int, _ pid: Int32, _ name: String, _ app: String?, _ runtime: String, _ manager: String, _ cwd: String, _ branch: String, system: Bool = false) -> Entry {
-    var e = Entry(port: port, addr: "127.0.0.1", pid: pid, name: name, cmd: name, cwd: cwd, system: system)
-    if !system {
-        var i = EnvInfo(); i.app = app; i.runtime = runtime; i.manager = manager
-        i.argv = [name]; i.exe = "~/.local/bin/" + name; i.details = ["exec: " + i.exe]
-        e.info = i
-    }
-    e.branch = branch
-    return e
-}
-
-let demoEntries: [Entry] = [
-    demoEntry(5173, 4101, "node", "Vite", "node 22.12.0", "nvm", "~/code/shop", "feature/checkout"),
-    demoEntry(8000, 4102, "python3.12", "uvicorn", "python 3.12.4", "venv .venv", "~/code/shop", "feature/checkout"),
-    demoEntry(8888, 4103, "python3.12", "JupyterLab", "python 3.12.4", "uv venv .venv", "~/notebooks/experiments", "main"),
-    demoEntry(3000, 4104, "node", "Next.js", "node 20.11.1", "Homebrew", "~/code/blog", "main"),
-    demoEntry(5000, 848, "ControlCenter", nil, "", "", "/", "", system: true),
-    demoEntry(7000, 848, "ControlCenter", nil, "", "", "/", "", system: true),
-    demoEntry(17500, 1162, "Dropbox", nil, "", "", "/", "", system: true),
-    demoEntry(57621, 2210, "Spotify", nil, "", "", "/", "", system: true),
-]
-let demoContainers: [Container] = [
-    Container(id: "9f1c2a7b3e4d", name: "shop-db", image: "postgres:16", status: "Up 3 hours", ports: [(5432, 5432, "tcp")]),
-    Container(id: "0a8e5d6c1b2f", name: "shop-cache", image: "redis:7", status: "Up 3 hours", ports: [(6379, 6379, "tcp")]),
-]
-let demoStopped: [RememberedServer] = [
-    RememberedServer(id: "docs", port: 4321, display: "Astro", cwd: home + "/code/docs", argv: ["npm", "run", "dev"], env: [:], lastSeen: Date().addingTimeInterval(-2 * 3600)),
-    RememberedServer(id: "api", port: 8080, display: "Django runserver", cwd: home + "/code/intranet", argv: ["python", "manage.py", "runserver"], env: [:], lastSeen: Date().addingTimeInterval(-26 * 3600)),
-]
-
 // MARK: - App
 
 let iconChoices: [(name: String, symbol: String)] = [
@@ -768,24 +733,15 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
         dbg("stopped: " + store.stopped(running: dev).map { ":\($0.port) \($0.display) \(tilde($0.cwd))" }.joined(separator: ", "))
         let n = dev.count + containers.count
         item.button?.title = n > 0 ? " \(n)" : ""
-        if demo { return }
         for e in dev { prober.probe(key: e.key, url: e.url) }
         store.remember(dev)
         for c in containers { for p in c.ports where p.proto == "tcp" { prober.probe(key: "\(c.key):\(p.host)", url: c.url(p.host)) } }
         diffAndNotify(dev: dev, containers: containers)
     }
 
-    func refreshSync() { apply(entries: demo ? demoEntries : collect(), containers: containers) }
+    func refreshSync() { apply(entries: collect(), containers: containers) }
 
     func refreshAsync() {
-        if demo {
-            prober.seed("4101:5173", "Vite · Shop"); prober.seed("4102:8000", "Uvicorn · Shop API")
-            prober.seed("4103:8888", "Jupyter · JupyterLab"); prober.seed("4104:3000", "Next.js · Blog", ok: false)
-            prober.seed("docker:shop-db:5432", ""); prober.seed("docker:shop-cache:6379", "")
-            known = [:]
-            apply(entries: demoEntries, containers: demoContainers)
-            return
-        }
         if refreshing { return }
         refreshing = true
         DispatchQueue.global(qos: .utility).async {
@@ -904,7 +860,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
                 }
             }
         }
-        let stopped = demo ? demoStopped : store.stopped(running: dev)
+        let stopped = store.stopped(running: dev)
         if !stopped.isEmpty {
             menu.addItem(.separator())
             menu.addItem(header("Recently stopped"))

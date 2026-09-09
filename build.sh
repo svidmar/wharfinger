@@ -13,14 +13,6 @@ if ! command -v swiftc >/dev/null 2>&1 || ! xcode-select -p >/dev/null 2>&1; the
     exit 1
 fi
 
-if [ "$1" = "--demo" ]; then
-    # Runs a second copy with made-up servers, for screenshots. Quit it from its own menu afterwards.
-    [ -x build/Wharfinger.app/Contents/MacOS/Wharfinger ] || "$0"
-    WHARFINGER_DEMO=1 build/Wharfinger.app/Contents/MacOS/Wharfinger &
-    echo "demo instance started (a second Wharfinger icon in the menu bar). Quit it from its menu when done."
-    exit 0
-fi
-
 if [ "$1" = "--icon" ]; then
     mkdir -p build
     swiftc -O -o build/make-icon Wharfinger/make-icon.swift && build/make-icon Wharfinger/AppIcon.icns
