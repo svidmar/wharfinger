@@ -3,7 +3,7 @@
 # Wharfinger
 
 See what is listening on localhost, what answers there, and open, kill or restart it.
-For macOS. A menu bar app plus a terminal command, no dependencies beyond what ships with macOS.
+For macOS. A menu bar app plus a `wharf` terminal command, no dependencies beyond what ships with macOS.
 
 <br clear="left">
 
@@ -25,7 +25,7 @@ the Xcode Command Line Tools (`xcode-select --install` if you don't have them).
 git clone https://github.com/svidmar/wharfinger.git
 cd wharfinger
 ./build.sh --install     # menu bar app  → ~/Applications/Wharfinger.app, launched
-./install.sh             # terminal command → ~/.local/bin/ports
+./install.sh             # terminal command → ~/.local/bin/wharf
 ```
 
 Building locally is what makes the app run without a Gatekeeper warning: macOS trusts apps you compiled
@@ -72,27 +72,27 @@ one row per app with its ports, so the list stays about your servers. A process 
 /Applications, /System, /Library or ~/Library.
 
 Requires macOS 13 or newer and the Xcode Command Line Tools (for `swiftc`). Source: `Wharfinger/main.swift`.
-`PORTS_DEBUG=1 build/Wharfinger.app/Contents/MacOS/Wharfinger` runs it in the terminal and logs
+`WHARFINGER_DEBUG=1 build/Wharfinger.app/Contents/MacOS/Wharfinger` runs it in the terminal and logs
 refreshes, probes and notifications.
 
 ## Terminal command
 
 ```
-./install.sh              # copies ports.py to ~/.local/bin/ports
-ports                     # interactive list
-ports list [-d]           # plain table (-d hides apps/system processes)
-ports who 3000            # who is using :3000? process, cwd, command, what answers (exit 1 if free)
-ports open 3000           # open http://localhost:3000
-ports kill 3000 [-9]      # kill whatever listens on :3000 (docker stop for containers)
-ports restart 3000        # stop and re-run the same command in a new Terminal window
-ports restart 3000 --here # same, but run it in this terminal
-ports edit 3000           # open the project in your editor (PORTS_EDITOR app name, else first installed, else $EDITOR)
-ports dir 3000            # print the project directory:  cd "$(ports dir 3000)"
-ports recent              # remembered servers that are not running now
-ports start 3000          # start a remembered server again (same command, cwd and env)
+./install.sh              # copies wharf.py to ~/.local/bin/wharf
+wharf                     # interactive list
+wharf list [-d]           # plain table (-d hides apps/system processes)
+wharf who 3000            # who is using :3000? process, cwd, command, what answers (exit 1 if free)
+wharf open 3000           # open http://localhost:3000
+wharf kill 3000 [-9]      # kill whatever listens on :3000 (docker stop for containers)
+wharf restart 3000        # stop and re-run the same command in a new Terminal window
+wharf restart 3000 --here # same, but run it in this terminal
+wharf edit 3000           # open the project in your editor (WHARFINGER_EDITOR app name, else first installed, else $EDITOR)
+wharf dir 3000            # print the project directory:  cd "$(wharf dir 3000)"
+wharf recent              # remembered servers that are not running now
+wharf start 3000          # start a remembered server again (same command, cwd and env)
 ```
 
-`ports who` also prints the environment (runtime and version, venv / conda / version manager, base interpreter,
+`wharf who` also prints the environment (runtime and version, venv / conda / version manager, base interpreter,
 executable), the git branch and the known routes. The interactive list marks servers that stopped answering HTTP.
 
 Keys in the interactive list:

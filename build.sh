@@ -39,5 +39,5 @@ if [ "$1" = "--install" ]; then
     cp -R "$app" ~/Applications/
     open ~/Applications/Wharfinger.app
     echo "installed and launched ~/Applications/Wharfinger.app"
-    echo "tip: ./install.sh puts the 'ports' command in ~/.local/bin"
+    echo "tip: ./install.sh puts the 'wharf' terminal command in ~/.local/bin"
 fi

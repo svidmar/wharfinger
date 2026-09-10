@@ -8,7 +8,7 @@ import UniformTypeIdentifiers
 import UserNotifications
 
 let home = NSHomeDirectory()
-let debug = ProcessInfo.processInfo.environment["PORTS_DEBUG"] != nil
+let debug = ProcessInfo.processInfo.environment["WHARFINGER_DEBUG"] != nil
 func dbg(_ s: String) { if debug { FileHandle.standardError.write((s + "\n").data(using: .utf8)!) } }
 let systemPrefixes = ["/System/", "/usr/libexec/", "/usr/sbin/", "/Library/", "/Applications/", home + "/Library/", "/private/var/"]
 let localAddrs: Set<String> = ["*", "0.0.0.0", "127.0.0.1", "::", "::1", "[::]", "[::1]", "localhost"]

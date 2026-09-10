@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""ports - see, open and kill local listening servers on macOS.
+"""wharf - see, open and kill local listening servers on macOS. The terminal side of Wharfinger.
 
 Usage:
-  ports                 interactive list (arrow keys, Enter/o = open, k = kill)
-  ports list [-d]       plain table (-d hides system/app processes)
-  ports who PORT        who is using PORT? (exit 1 if free)
-  ports open PORT       open http://localhost:PORT in the browser
-  ports kill PORT [-9]  kill the process (or stop the container) listening on PORT
-  ports restart PORT    stop it and start the same command again (same cwd and env)
+  wharf                 interactive list (arrow keys, Enter/o = open, k = kill)
+  wharf list [-d]       plain table (-d hides system/app processes)
+  wharf who PORT        who is using PORT? (exit 1 if free)
+  wharf open PORT       open http://localhost:PORT in the browser
+  wharf kill PORT [-9]  kill the process (or stop the container) listening on PORT
+  wharf restart PORT    stop it and start the same command again (same cwd and env)
                         in a new Terminal window; --here runs it in this terminal instead
-  ports edit PORT       open the project directory in your editor ($PORTS_EDITOR app name,
+  wharf edit PORT       open the project directory in your editor ($WHARFINGER_EDITOR app name,
                         else VS Code / Cursor / Zed …, else $VISUAL / $EDITOR)
-  ports dir PORT        print the project directory, for: cd "$(ports dir 3000)"
-  ports recent          dev servers seen before that are not running now
-  ports start PORT      start a remembered server again (same command, cwd and env);
+  wharf dir PORT        print the project directory, for: cd "$(wharf dir 3000)"
+  wharf recent          dev servers seen before that are not running now
+  wharf start PORT      start a remembered server again (same command, cwd and env);
                         --here runs it in this terminal instead of a new Terminal window
 
 Docker containers with published ports are listed too, when the daemon runs.
@@ -231,7 +231,7 @@ FRAMEWORK_HINTS = [
 
 def probe(url: str, timeout: float = 1.5) -> str:
     """One GET; returns 'Framework · Page title' or '' when nothing HTTP answers."""
-    req = urllib.request.Request(url, headers={"User-Agent": "ports/1.0"})
+    req = urllib.request.Request(url, headers={"User-Agent": "Wharfinger/1.0"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             status, headers, body = r.status, r.headers, r.read(200_000).decode("utf-8", "replace")
@@ -506,7 +506,7 @@ def store_id(cwd: str, argv) -> str:
 
 
 def remember(entries):
-    """Record running dev servers so `ports start` can bring them back later. Shares the file with the app."""
+    """Record running dev servers so `wharf start` can bring them back later. Shares the file with the app."""
     store = load_store()
     changed = False
     for e in entries:
@@ -535,7 +535,7 @@ def cmd_recent():
     print(f"{'PORT':>5}  {'PROCESS':<18} {'LAST SEEN':<20} {'CWD'}")
     for s in stopped[:15]:
         print(f"{s['port']:>5}  {s['display'][:18]:<18} {s['lastSeen'][:16].replace('T', ' '):<20} {_tilde(s['cwd'])}")
-    print("start one with: ports start PORT")
+    print("start one with: wharf start PORT")
 
 
 def cmd_start(port: int, here: bool):
@@ -544,7 +544,7 @@ def cmd_start(port: int, here: bool):
         sys.exit(1)
     match = [s for s in recently_stopped([]) if s["port"] == port]
     if not match:
-        print(f"no remembered server on :{port} (see: ports recent)", file=sys.stderr)
+        print(f"no remembered server on :{port} (see: wharf recent)", file=sys.stderr)
         sys.exit(1)
     s = match[0]
     script = write_restart_script(s["argv"], s["env"], s["cwd"], port)
@@ -653,7 +653,7 @@ def cmd_who(port: int):
     print(f"  url:     {e.url}")
     for r in known_routes(e):
         print(f"           {e.url}{r}")
-    print(f"  free it: ports kill {port}")
+    print(f"  free it: wharf kill {port}")
 
 
 def cmd_open(port: int):
@@ -689,7 +689,7 @@ def project_dir(port: int) -> str:
 
 
 def open_in_editor(d: str) -> str:
-    app = os.environ.get("PORTS_EDITOR")
+    app = os.environ.get("WHARFINGER_EDITOR")
     if not app:
         app = next((a for a in EDITOR_APPS if any(os.path.isdir(f"{root}/{a}.app") for root in ("/Applications", HOME + "/Applications"))), "")
     if app:
@@ -698,7 +698,7 @@ def open_in_editor(d: str) -> str:
     ed = os.environ.get("VISUAL") or os.environ.get("EDITOR")
     if ed:
         os.execvp("/bin/sh", ["/bin/sh", "-c", f'{ed} "$1"', "sh", d])
-    return "no editor found: set PORTS_EDITOR to an app name, or $EDITOR"
+    return "no editor found: set WHARFINGER_EDITOR to an app name, or $EDITOR"
 
 
 def cmd_edit(port: int):
