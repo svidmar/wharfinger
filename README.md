@@ -48,6 +48,8 @@ To update, `git pull` and run `./build.sh --install` again. To uninstall, quit i
 ## Menu bar app
 
 - The icon shows how many dev servers and containers are listening. Click it for the list.
+- A filter field at the top of the menu: start typing to narrow the list by port, program, project or branch.
+- Rows carry an icon for what they are: Python, Node, Ruby, PHP, Java, Jupyter, a database, a Docker container, an app.
 - Each row: port, program, what answers on it (framework · page title), runtime and environment, project directory
   and its git branch (worktrees included).
 - Servers in the same directory (a frontend and its API, say) are grouped under a project row with the branch.

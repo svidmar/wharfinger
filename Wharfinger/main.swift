@@ -647,6 +647,35 @@ final class Prober {
     }
 }
 
+// MARK: - Row icons
+
+/// SF Symbol + colour for a row, keyed on what we know about it.
+func rowSymbol(_ e: Entry) -> (String, NSColor) {
+    let app = (e.info?.app ?? "").lowercased()
+    let rt = (e.info?.runtime ?? "").lowercased()
+    let name = e.name.lowercased()
+    if app.contains("jupyter") { return ("book.closed.fill", .systemOrange) }
+    if ["postgres", "mysql", "mariadb", "mongod", "redis", "sqlite", "clickhouse", "elasticsearch"].contains(where: { name.contains($0) }) {
+        return ("cylinder.fill", .systemTeal)
+    }
+    if rt.hasPrefix("python") { return ("chevron.left.forwardslash.chevron.right", .systemBlue) }
+    if rt.hasPrefix("node") || rt.hasPrefix("bun") || rt.hasPrefix("deno") { return ("curlybraces", .systemGreen) }
+    if rt.hasPrefix("ruby") { return ("diamond.fill", .systemRed) }
+    if rt.hasPrefix("php") { return ("p.square.fill", .systemIndigo) }
+    if rt.hasPrefix("java") { return ("cup.and.saucer.fill", .systemBrown) }
+    if rt.hasPrefix("elixir") { return ("drop.fill", .systemPurple) }
+    if e.system { return ("app.fill", .tertiaryLabelColor) }
+    return ("bolt.horizontal.fill", .systemGray)
+}
+
+func symbolImage(_ name: String, _ color: NSColor, size: CGFloat = 13) -> NSImage? {
+    let config = NSImage.SymbolConfiguration(pointSize: size, weight: .medium)
+        .applying(NSImage.SymbolConfiguration(paletteColors: [color]))
+    let img = NSImage(systemSymbolName: name, accessibilityDescription: nil)?.withSymbolConfiguration(config)
+    img?.isTemplate = false
+    return img
+}
+
 // MARK: - App
 
 let iconChoices: [(name: String, symbol: String)] = [
@@ -827,6 +856,9 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
         menuItems.removeAll()
         rowGroups.removeAll()
         rowInProject.removeAll()
+        searchable.removeAll()
+        sectionHeaders.removeAll()
+        menu.addItem(searchItem())
         let dev = devEntries()
         let devKeys = Set(dev.map { $0.key })
         let other = entries.filter { !devKeys.contains($0.key) }
@@ -834,7 +866,9 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
         if dev.isEmpty {
             menu.addItem(header("No dev servers listening"))
         } else {
-            menu.addItem(header("Dev servers"))
+            let h = header("Dev servers"); menu.addItem(h)
+            var rowsInSection: [NSMenuItem] = []
+            defer { sectionHeaders.append((h, rowsInSection)) }
             // A process with many ports (a Jupyter kernel has five) becomes one row.
             var byPid: [[Entry]] = []
             for e in dev {
@@ -853,23 +887,29 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
             for p in order {
                 let group = projects[p]!
                 if !p.isEmpty && group.count > 1 {
-                    menu.addItem(projectItem(group[0][0]))
-                    for r in group { let it = entryItem(r, inProject: true); it.indentationLevel = 1; menu.addItem(it) }
+                    let pi = projectItem(group[0][0]); menu.addItem(pi); rowsInSection.append(pi)
+                    let ptext = (p + " " + group[0][0].branch).lowercased()
+                    searchable.append((pi, ptext))
+                    for r in group { let it = entryItem(r, inProject: true); it.indentationLevel = 1; menu.addItem(it); rowsInSection.append(it) }
                 } else {
-                    group.forEach { menu.addItem(entryItem($0)) }
+                    group.forEach { let it = entryItem($0); menu.addItem(it); rowsInSection.append(it) }
                 }
             }
         }
         let stopped = store.stopped(running: dev)
         if !stopped.isEmpty {
             menu.addItem(.separator())
-            menu.addItem(header("Recently stopped"))
-            stopped.forEach { menu.addItem(stoppedItem($0)) }
+            let h = header("Recently stopped"); menu.addItem(h)
+            var rows: [NSMenuItem] = []
+            stopped.forEach { let it = stoppedItem($0); menu.addItem(it); rows.append(it) }
+            sectionHeaders.append((h, rows))
         }
         if !containers.isEmpty {
             menu.addItem(.separator())
-            menu.addItem(header("Docker"))
-            containers.forEach { menu.addItem(containerItem($0)) }
+            let h = header("Docker"); menu.addItem(h)
+            var rows: [NSMenuItem] = []
+            containers.forEach { let it = containerItem($0); menu.addItem(it); rows.append(it) }
+            sectionHeaders.append((h, rows))
         }
         menu.addItem(.separator())
         if !other.isEmpty {
@@ -984,6 +1024,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
         }
         let hung = group.contains { prober.hung($0.key) }
         let t = NSMutableAttributedString(attributedString: rowTitle(port: port, name: e.display, probe: probe, detail: detail))
+        if hung, let it = menuItems[e.key] { it.image = symbolImage("exclamationmark.triangle.fill", .systemRed) }
         if hung {
             t.append(NSAttributedString(string: "   ⚠︎ not responding", attributes: [.font: small, .foregroundColor: NSColor.systemRed]))
         }
@@ -997,7 +1038,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
             t.append(NSAttributedString(string: "   ⎇ \(e.branch)", attributes: [.font: small, .foregroundColor: NSColor.secondaryLabelColor]))
         }
         it.attributedTitle = t
-        it.image = NSImage(systemSymbolName: "folder", accessibilityDescription: nil)
+        it.image = symbolImage("folder.fill", .secondaryLabelColor)
         let box = Box(e)
         it.representedObject = box
         let sub = NSMenu()
@@ -1014,6 +1055,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
         t.append(NSAttributedString(string: r.display, attributes: [.font: NSFont.menuFont(ofSize: 0), .foregroundColor: NSColor.secondaryLabelColor]))
         t.append(NSAttributedString(string: "   \(tilde(r.cwd))   \(ago(r.lastSeen))", attributes: [.font: small, .foregroundColor: NSColor.tertiaryLabelColor]))
         it.attributedTitle = t
+        it.image = symbolImage("clock.arrow.circlepath", .tertiaryLabelColor)
+        searchable.append((it, (":\(r.port) " + r.display + " " + tilde(r.cwd) + " stopped").lowercased()))
         let sub = NSMenu()
         let start = NSMenuItem(title: "Start again (in a new Terminal window)", action: #selector(startAgain(_:)), keyEquivalent: "")
         start.target = self; start.representedObject = r.id
@@ -1043,11 +1086,61 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
 
     var rowInProject: Set<String> = []
 
+    // Search: a text field at the top of the menu; rows that don't match are hidden while it is open.
+    let searchField = NSSearchField(frame: NSRect(x: 0, y: 0, width: 520, height: 24))
+    var searchable: [(item: NSMenuItem, text: String)] = []
+    var sectionHeaders: [(header: NSMenuItem, rows: [NSMenuItem])] = []
+
+    func searchItem() -> NSMenuItem {
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 548, height: 30))
+        container.autoresizingMask = [.width]
+        searchField.frame = NSRect(x: 14, y: 3, width: container.frame.width - 28, height: 24)
+        searchField.autoresizingMask = [.width]
+        searchField.placeholderString = "Filter by port, program, project, branch…"
+        searchField.font = NSFont.menuFont(ofSize: NSFont.smallSystemFontSize)
+        searchField.controlSize = .small
+        searchField.target = self
+        searchField.action = #selector(searchChanged)
+        searchField.sendsSearchStringImmediately = true
+        searchField.sendsWholeSearchString = false
+        searchField.stringValue = ""
+        container.addSubview(searchField)
+        let it = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        it.view = container
+        return it
+    }
+
+    @objc func searchChanged() { applyFilter(searchField.stringValue) }
+
+    func applyFilter(_ raw: String) {
+        let q = raw.trimmingCharacters(in: .whitespaces).lowercased()
+        for (item, text) in searchable { item.isHidden = !q.isEmpty && !text.contains(q) }
+        for (header, rows) in sectionHeaders { header.isHidden = !q.isEmpty && rows.allSatisfy { $0.isHidden } }
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        guard menu === self.menu else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.searchField.window?.makeFirstResponder(self.searchField)
+        }
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        guard menu === self.menu else { return }
+        searchField.stringValue = ""
+    }
+
     func entryItem(_ group: [Entry], inProject: Bool = false) -> NSMenuItem {
         let e = group[0]
         let it = NSMenuItem(title: "", action: nil, keyEquivalent: "")
         it.attributedTitle = entryTitle(group, inProject: inProject)
         if inProject { for g in group { rowInProject.insert(g.key) } }
+        let (sym, color) = rowSymbol(e)
+        it.image = group.contains(where: { prober.hung($0.key) }) ? symbolImage("exclamationmark.triangle.fill", .systemRed) : symbolImage(sym, color)
+        let text = (group.map { ":\($0.port)" }.joined(separator: " ") + " " + e.display + " " + e.name + " " + (prober.label(e.key) ?? "")
+                    + " " + (e.info?.tag ?? "") + " " + e.cwd + " " + e.branch).lowercased()
+        searchable.append((it, text))
         let box = Box(e)
         it.representedObject = box
         for g in group { menuItems[g.key] = it; rowGroups[g.key] = group }
@@ -1113,6 +1206,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
     func containerItem(_ c: Container) -> NSMenuItem {
         let it = NSMenuItem(title: "", action: nil, keyEquivalent: "")
         it.attributedTitle = containerTitle(c)
+        it.image = symbolImage("shippingbox.fill", .systemBlue)
+        searchable.append((it, (c.ports.map { ":\($0.host)" }.joined(separator: " ") + " " + c.name + " " + c.image + " docker").lowercased()))
         let box = Box(c, port: c.ports.first?.host ?? 0)
         it.representedObject = box
         for p in c.ports { menuItems["\(c.key):\(p.host)"] = it }
