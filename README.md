@@ -21,6 +21,18 @@ For macOS. A menu bar app plus a `wharf` terminal command, no dependencies beyon
 Wharfinger is built from source on your own Mac. It takes about twenty seconds and needs nothing but
 the Xcode Command Line Tools (`xcode-select --install` if you don't have them).
 
+**With Homebrew:**
+
+```
+brew install svidmar/tap/wharfinger
+cp -R "$(brew --prefix)/opt/wharfinger/Wharfinger.app" ~/Applications/ && open ~/Applications/Wharfinger.app
+```
+
+The first line builds the app and installs the `wharf` command; the second puts the app where Spotlight,
+"Start at login" and notifications expect it. `brew upgrade wharfinger` updates both (repeat the copy).
+
+**From a clone:**
+
 ```
 git clone https://github.com/svidmar/wharfinger.git
 cd wharfinger
